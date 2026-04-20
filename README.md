@@ -154,3 +154,7 @@ Contributions and Pull Requests (PRs) are always welcome. Let's make deployments
 
 ### 👨‍💻 Author
 **FastCICD** is designed and developed by **Morteza Mirshekar**.
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
