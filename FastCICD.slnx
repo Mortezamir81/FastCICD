@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/Client/">
+    <Project Path="FastCICD/FastCICD.csproj" />
+  </Folder>
+  <Folder Name="/Server/">
+    <Project Path="CICD_API/CICD_API.csproj" />
+  </Folder>
+  <Folder Name="/Solution Items/">
+    <File Path="README.md" />
+  </Folder>
+</Solution>
