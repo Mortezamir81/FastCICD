@@ -138,5 +138,19 @@ Once configured, simply run the FastCICD Client console application. You will be
 
 ---
 
+## 🤝 Feedback & Contributions
+
+This project is open-source, and your feedback is highly appreciated! 
+
+If you encounter any bugs, have a feature request, or just want to suggest an improvement, please feel free to open an issue.
+
+* 🐛 **Found a bug?** Let me know so I can fix it!
+* 💡 **Have an idea?** I'm always open to discussing new features.
+* ⭐ **Love FastCICD?** Don't forget to give this repository a star to support the project!
+
+**[👉 Click here to open an Issue](../../issues)**
+
+Contributions and Pull Requests (PRs) are always welcome. Let's make deployments easier together!
+
 ### 👨‍💻 Author
 **FastCICD** is designed and developed by **Morteza Mirshekar**.
