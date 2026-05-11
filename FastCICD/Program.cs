@@ -72,18 +72,27 @@ static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig projec
 		AnsiConsole.Write(new Rule($"[cyan]Project:[/] [bold yellow]{project.Name}[/]").RuleStyle("grey").LeftJustified());
 
 		AnsiConsole.WriteLine();
+
+		var menuChoices = new List<string>
+		{
+			MenuOptions.Deploy,
+			MenuOptions.CheckStatus,
+			MenuOptions.CheckVersion,
+			MenuOptions.StartServices,
+			MenuOptions.StopServices
+		};
+
+		if (project.EnableRollback)
+		{
+			menuChoices.Add(MenuOptions.Rollback);
+		}
+
+		menuChoices.Add(MenuOptions.Back);
+
 		var projectAction = AnsiConsole.Prompt(
 			new SelectionPrompt<string>()
 				.Title("[green]Select an action for this project:[/]")
-				.AddChoices(
-					MenuOptions.Deploy,
-					MenuOptions.CheckStatus,
-					MenuOptions.CheckVersion,
-					MenuOptions.StartServices,
-					MenuOptions.StopServices,
-					MenuOptions.Rollback,
-					MenuOptions.Back
-				)
+				.AddChoices(menuChoices)
 		);
 
 		switch (projectAction)
@@ -375,7 +384,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 				AnsiConsole.Write(table);
 
 				// Pass the version variable here
-				await UploadDeltaZipAsync(httpClient, project.LocalSourcePath, project.Name, deltaFiles, version, ctx);
+				await UploadDeltaZipAsync(httpClient, project, deltaFiles, version, ctx);
 				AnsiConsole.MarkupLine("[grey]Files uploaded and extracted successfully.[/]");
 
 				if (project.PostDeployCommands.Count != 0)
@@ -445,7 +454,7 @@ static Dictionary<string, string> GetLocalFileHashes(string basePath, List<strin
 	return hashes.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
 }
 
-static async Task UploadDeltaZipAsync(HttpClient client, string localBase, string projectName, List<string> deltaFiles, string version, StatusContext ctx)
+static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, List<string> deltaFiles, string version, StatusContext ctx)
 {
 	var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
 	var zipPath = tempDir + ".zip";
@@ -458,7 +467,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, string localBase, strin
 
 		foreach (var file in deltaFiles)
 		{
-			var sourceFile = Path.Combine(localBase, file);
+			var sourceFile = Path.Combine(project.LocalSourcePath, file);
 			var destFile = Path.Combine(tempDir, file);
 			Directory.CreateDirectory(Path.GetDirectoryName(destFile)!);
 			File.Copy(sourceFile, destFile);
@@ -488,7 +497,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, string localBase, strin
 
 				form.Add(progressContent, "file", "delta.zip");
 
-				var response = await client.PostAsync($"/api/upload?projectName={Uri.EscapeDataString(projectName)}&version={Uri.EscapeDataString(version)}", form);
+				var response = await client.PostAsync($"/api/upload?projectName={Uri.EscapeDataString(project.Name)}&version={Uri.EscapeDataString(version)}&enableBackup={project.EnableRollback}", form);
 				await response.EnsureSuccessWithDetailsAsync();
 			}
 		}
