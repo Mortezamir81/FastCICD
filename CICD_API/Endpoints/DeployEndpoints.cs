@@ -128,7 +128,7 @@ public static class DeployEndpoints
 		});
 
 		// Updated Upload: Receive version and project name
-		app.MapPost("/api/upload", async (HttpRequest request, [FromQuery] string projectName, [FromQuery] string version, IConfiguration config, ILogger<Program> logger) =>
+		app.MapPost("/api/upload", async (HttpRequest request, [FromQuery] string projectName, [FromQuery] string version, [FromQuery] bool enableBackup, IConfiguration config, ILogger<Program> logger) =>
 		{
 			logger.LogInformation("Upload initiated for project '{ProjectName}', Version: '{Version}'.", projectName, version);
 
@@ -142,7 +142,7 @@ public static class DeployEndpoints
 			}
 
 			// 1. Take Backup
-			if (!string.IsNullOrEmpty(backupDirBase))
+			if (enableBackup && !string.IsNullOrEmpty(backupDirBase))
 			{
 				var projectBackupDir = Path.Combine(backupDirBase, projectName);
 				Directory.CreateDirectory(projectBackupDir);
@@ -153,6 +153,10 @@ public static class DeployEndpoints
 					logger.LogInformation("Creating backup for '{ProjectName}' at '{BackupFilePath}'.", projectName, backupFilePath);
 					ZipFile.CreateFromDirectory(baseDir, backupFilePath);
 				}
+			}
+			else
+			{
+				logger.LogInformation("Backup creation is skipped for project '{ProjectName}' as per request.", projectName);
 			}
 
 			// 2. Extract Files
