@@ -3,16 +3,16 @@ using CICD_API.Middlewares;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Increase maximum request body size for Kestrel (Set to 100 MB)
-builder.WebHost.ConfigureKestrel(serverOptions =>
+// 1. Remove request size limit for Kestrel server
+builder.WebHost.ConfigureKestrel(options =>
 {
-	serverOptions.Limits.MaxRequestBodySize = 104857600;
+	options.Limits.MaxRequestBodySize = null; // Unlimited size
 });
 
-// Increase multipart form body length limit for file uploads (Set to 100 MB)
+// 2. Remove multipart form size limit for file uploads
 builder.Services.Configure<Microsoft.AspNetCore.Http.Features.FormOptions>(options =>
 {
-	options.MultipartBodyLengthLimit = 104857600;
+	options.MultipartBodyLengthLimit = long.MaxValue;
 });
 
 var app = builder.Build();

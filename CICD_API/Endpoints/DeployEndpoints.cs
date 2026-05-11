@@ -180,7 +180,41 @@ public static class DeployEndpoints
 				}
 
 				logger.LogInformation("Extracting uploaded zip to '{BaseDirectory}'.", baseDir);
-				ZipFile.ExtractToDirectory(tempZipPath, baseDir, overwriteFiles: true);
+
+				// 🚀 ROBUST EXTRACTION: Handles Read-Only files (like .git objects) safely
+				using (var archive = ZipFile.OpenRead(tempZipPath))
+				{
+					foreach (var entry in archive.Entries)
+					{
+						// Prevent Zip Slip vulnerability
+						var destinationPath = Path.GetFullPath(Path.Combine(baseDir, entry.FullName));
+						if (!destinationPath.StartsWith(baseDir))
+							continue;
+
+						if (string.IsNullOrEmpty(entry.Name))
+						{
+							// It's a directory
+							Directory.CreateDirectory(destinationPath);
+						}
+						else
+						{
+							// It's a file
+							Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+
+							if (File.Exists(destinationPath))
+							{
+								// Force remove Read-Only attribute before overwriting
+								var attributes = File.GetAttributes(destinationPath);
+								if ((attributes & FileAttributes.ReadOnly) == FileAttributes.ReadOnly)
+								{
+									File.SetAttributes(destinationPath, attributes & ~FileAttributes.ReadOnly);
+								}
+							}
+
+							entry.ExtractToFile(destinationPath, overwrite: true);
+						}
+					}
+				}
 
 				// 3. Save Version Info
 				if (enableBackup && !string.IsNullOrEmpty(backupDirBase))
@@ -329,12 +363,21 @@ public static class DeployEndpoints
 					// Use baseDir if it exists, otherwise fallback to Temp directory
 					string safeWorkingDirectory = Directory.Exists(baseDir) ? baseDir : Path.GetTempPath();
 
-					logger.LogInformation("Executing command: '{Command}' in directory '{BaseDirectory}'", cmd, safeWorkingDirectory);
+					// Mask sensitive commands for logging purposes to prevent password leaks
+					string loggableCmd = cmd;
+					if (loggableCmd.Contains("Unlock-BitLocker", StringComparison.OrdinalIgnoreCase) ||
+						loggableCmd.Contains("-Password", StringComparison.OrdinalIgnoreCase))
+					{
+						loggableCmd = "[REDACTED SECURE COMMAND]";
+					}
+
+					logger.LogInformation("Executing command: '{Command}' in directory '{BaseDirectory}'", loggableCmd, safeWorkingDirectory);
 					bool isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
 
 					var processInfo = new System.Diagnostics.ProcessStartInfo
 					{
 						FileName = isWindows ? "cmd.exe" : "/bin/bash",
+						// Ensure the REAL command is passed to the OS, not the redacted one
 						Arguments = isWindows ? $"/c {cmd}" : $"-c \"{cmd}\"",
 						WorkingDirectory = safeWorkingDirectory,
 						RedirectStandardOutput = true,
@@ -346,7 +389,6 @@ public static class DeployEndpoints
 					using var process = System.Diagnostics.Process.Start(processInfo);
 					if (process != null)
 					{
-						// Prevent server freeze by adding a strict 2-minute timeout
 						using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
 
 						try
@@ -355,9 +397,9 @@ public static class DeployEndpoints
 						}
 						catch (TaskCanceledException)
 						{
-							logger.LogError("Command '{Command}' timed out after 2 minutes. Killing process.", cmd);
+							logger.LogError("Command '{Command}' timed out after 2 minutes. Killing process.", loggableCmd);
 							process.Kill();
-							return Results.Problem($"Command '{cmd}' timed out after 2 minutes.");
+							return Results.Problem($"Command '{loggableCmd}' timed out after 2 minutes.");
 						}
 
 						var output = await process.StandardOutput.ReadToEndAsync();
@@ -365,18 +407,20 @@ public static class DeployEndpoints
 
 						if (process.ExitCode != 0)
 						{
-							logger.LogError("Command '{Command}' failed with exit code {ExitCode}. Error output: {Error}", cmd, process.ExitCode, error);
-							return Results.Problem($"Command '{cmd}' failed with exit code {process.ExitCode}.\nError: {error}");
+							logger.LogError("Command '{Command}' failed with exit code {ExitCode}. Error output: {Error}", loggableCmd, process.ExitCode, error);
+							return Results.Problem($"Command '{loggableCmd}' failed with exit code {process.ExitCode}.\nError: {error}");
 						}
 
-						logger.LogInformation("Command '{Command}' executed successfully.", cmd);
-						results.Add(new { Command = cmd, Output = output });
+						logger.LogInformation("Command '{Command}' executed successfully.", loggableCmd);
+
+						// Mask output in results if needed, though usually standard output of BitLocker doesn't echo the password
+						results.Add(new { Command = loggableCmd, Output = output });
 					}
 				}
 				catch (Exception ex)
 				{
-					logger.LogError(ex, "Exception occurred while executing command '{Command}': {Message}", cmd, ex.Message);
-					return Results.Problem($"Failed to execute '{cmd}': {ex.Message}");
+					logger.LogError(ex, "Exception occurred while executing command: {Message}", ex.Message);
+					return Results.Problem($"Failed to execute command: {ex.Message}");
 				}
 			}
 
