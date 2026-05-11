@@ -82,6 +82,11 @@ static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig projec
 			MenuOptions.StopServices
 		};
 
+		if (project.PreDeployCommands.Count > 0)
+			menuChoices.Add(MenuOptions.RunPreDeploy);
+		if (project.PostDeployCommands.Count > 0)
+			menuChoices.Add(MenuOptions.RunPostDeploy);
+
 		if (project.EnableRollback)
 		{
 			menuChoices.Add(MenuOptions.Rollback);
@@ -117,6 +122,14 @@ static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig projec
 				await ManageServicesAsync(client, project.ServicesToManage, "stop");
 				break;
 
+			case MenuOptions.RunPreDeploy:
+				await ManualExecuteCommandsAsync(client, project.Name, project.PreDeployCommands, "Pre-Deploy");
+				break;
+
+			case MenuOptions.RunPostDeploy:
+				await ManualExecuteCommandsAsync(client, project.Name, project.PostDeployCommands, "Post-Deploy");
+				break;
+
 			case MenuOptions.Rollback:
 				await HandleRollbackAsync(client, project);
 				break;
@@ -143,21 +156,18 @@ static async Task ShowCurrentVersionAsync(HttpClient client, string projectName)
 		await res.EnsureSuccessWithDetailsAsync();
 
 		var data = await res.Content.ReadFromJsonAsync<VersionResponse>();
-		string version = data?.Version ?? "Unknown";
-		string date = data?.DeployDate ?? "-";
 
-		var panel = new Panel(new Markup($"Current Version: [bold yellow]{version}[/]\nDeploy Date: [bold blue]{date}[/]"))
+		// Displaying the information in a clean panel
+		var panel = new Panel(new Markup($"Current Version: [bold yellow]{data?.Version}[/]\nDeploy Date: [bold blue]{data?.DeployDate}[/]"))
 		{
-			Header = new PanelHeader("Server Version Info"),
-			Border = BoxBorder.Rounded,
-			Padding = new Padding(1, 1, 1, 1)
+			Header = new PanelHeader("Deployment Metadata"),
+			Border = BoxBorder.Rounded
 		};
-
 		AnsiConsole.Write(panel);
 	}
 	catch (Exception ex)
 	{
-		AnsiConsole.MarkupLine($"[red]Error fetching version:[/] {ex.Message}");
+		AnsiConsole.MarkupLine($"[red]Error fetching version:[/] {Markup.Escape(ex.Message)}");
 	}
 }
 
@@ -190,7 +200,7 @@ static async Task CheckServicesStatusAsync(HttpClient client, List<string> servi
 	}
 	catch (Exception ex)
 	{
-		AnsiConsole.MarkupLine($"[red]Error checking status:[/] {ex.Message}");
+		AnsiConsole.MarkupLine($"[red]Error checking status:[/] {Markup.Escape(ex.Message)}");
 	}
 }
 
@@ -212,7 +222,7 @@ static async Task ManageServicesAsync(HttpClient client, List<string> services, 
 		}
 		catch (Exception ex)
 		{
-			AnsiConsole.MarkupLine($"[bold red]❌ Failed to {action} services:[/] {ex.Message}");
+			AnsiConsole.MarkupLine($"[bold red]❌ Failed to {action} services:[/] {Markup.Escape(ex.Message)}");
 		}
 	});
 }
@@ -273,7 +283,7 @@ static async Task HandleRollbackAsync(HttpClient client, ProjectConfig project)
 	catch (Exception ex)
 	{
 		AnsiConsole.WriteLine();
-		AnsiConsole.MarkupLine($"[bold red]❌ Rollback Failed:[/] {ex.Message}");
+		AnsiConsole.MarkupLine($"[bold red]❌ Rollback Failed:[/] {Markup.Escape(ex.Message)}");
 	}
 }
 
@@ -286,27 +296,37 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 		return;
 	}
 
-	// 1. Fetch current version before starting the deployment
-	string currentVersion = "Unknown";
-	try
+	string version = ""; // Default empty version for when rollback is disabled
+
+	if (project.EnableRollback)
 	{
-		var versionRes = await httpClient.GetAsync($"/api/version?projectName={project.Name}");
-		if (versionRes.IsSuccessStatusCode)
+		// 1. Fetch current version before starting the deployment
+		string currentVersion = "Unknown";
+		try
 		{
-			var data = await versionRes.Content.ReadFromJsonAsync<VersionResponse>();
-			currentVersion = data?.Version ?? "Unknown";
+			var versionRes = await httpClient.GetAsync($"/api/version?projectName={project.Name}");
+			if (versionRes.IsSuccessStatusCode)
+			{
+				var data = await versionRes.Content.ReadFromJsonAsync<VersionResponse>();
+				currentVersion = data?.Version ?? "Unknown";
+			}
 		}
+		catch
+		{
+			// Ignore error if it's the first deployment or drive is locked
+		}
+
+		AnsiConsole.WriteLine();
+		AnsiConsole.MarkupLine($"[cyan]Current Server Version:[/] [bold yellow]{currentVersion}[/]");
+
+		// 2. Ask for the new version BEFORE starting the UI spinner
+		version = AnsiConsole.Ask<string>("[white]Enter [green]NEW[/] version label (e.g. 1.0.2):[/]");
 	}
-	catch
+	else
 	{
-		// Ignore error if it's the first deployment and version.json doesn't exist
+		AnsiConsole.WriteLine();
+		AnsiConsole.MarkupLine("[grey]Versioning and Rollback are disabled for this project. Proceeding directly to deployment...[/]");
 	}
-
-	AnsiConsole.WriteLine();
-	AnsiConsole.MarkupLine($"[cyan]Current Server Version:[/] [bold yellow]{currentVersion}[/]");
-
-	// 2. Ask for the new version BEFORE starting the UI spinner
-	var version = AnsiConsole.Ask<string>("[white]Enter [green]NEW[/] version label (e.g. 1.0.2):[/]");
 
 	// 3. Start the deployment pipeline
 	await AnsiConsole.Status()
@@ -315,6 +335,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 		.StartAsync("Initializing...", async ctx =>
 		{
 			bool servicesWereStopped = false;
+			bool wasDeltaUploadedSuccessfully = false;
 
 			try
 			{
@@ -387,12 +408,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 				await UploadDeltaZipAsync(httpClient, project, deltaFiles, version, ctx);
 				AnsiConsole.MarkupLine("[grey]Files uploaded and extracted successfully.[/]");
 
-				if (project.PostDeployCommands.Count != 0)
-				{
-					ctx.Status("[magenta]Executing Post-Deploy CLI Commands on server...[/]");
-					await ExecuteRemoteCommandsAsync(httpClient, project.Name, project.PostDeployCommands);
-					AnsiConsole.MarkupLine("[grey]✓ Post-Deploy commands executed successfully.[/]");
-				}
+				wasDeltaUploadedSuccessfully = true;
 
 				AnsiConsole.WriteLine();
 				AnsiConsole.MarkupLine("[bold green]🚀 Deployment Completed Successfully![/]");
@@ -400,10 +416,30 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 			catch (Exception ex)
 			{
 				AnsiConsole.WriteLine();
-				AnsiConsole.MarkupLine($"[bold red]❌ Deployment Failed:[/] {ex.Message}");
+				AnsiConsole.MarkupLine($"[bold red]❌ Deployment Failed:[/] {Markup.Escape(ex.Message)}");
 			}
 			finally
 			{
+				// 1. Evaluate and execute Post-Deploy commands safely
+				bool shouldRunPostDeploy = project.PostDeployCommands.Count != 0 &&
+										   (project.AlwaysRunPostDeployCommands || wasDeltaUploadedSuccessfully);
+
+				if (shouldRunPostDeploy)
+				{
+					ctx.Status("[magenta]Executing Post-Deploy CLI Commands on server...[/]");
+					try
+					{
+						await ExecuteRemoteCommandsAsync(httpClient, project.Name, project.PostDeployCommands);
+						AnsiConsole.MarkupLine("[grey]✓ Post-Deploy commands executed successfully.[/]");
+					}
+					catch (Exception postEx)
+					{
+						// Wrap in a try-catch so it doesn't crash and block the service restart (Safety Net)
+						AnsiConsole.MarkupLine($"[bold red]❌ Post-Deploy commands failed:[/] {Markup.Escape(postEx.Message)}");
+					}
+				}
+
+				// 2. Execute Safety Net: Restarting Windows Services
 				if (servicesWereStopped)
 				{
 					ctx.Status("[green]Executing Safety Net: Restarting Windows Services...[/]");
@@ -416,7 +452,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 					}
 					catch (Exception finalEx)
 					{
-						AnsiConsole.MarkupLine($"[bold white on red] CRITICAL ERROR: Could not restart services. Manual intervention required! [/] {finalEx.Message}");
+						AnsiConsole.MarkupLine($"[bold white on red] CRITICAL ERROR: Could not restart services. Manual intervention required! [/] {Markup.Escape(finalEx.Message)}");
 					}
 				}
 			}
@@ -525,4 +561,23 @@ static async Task ExecuteRemoteCommandsAsync(HttpClient client, string projectNa
 		var errorContent = await res.Content.ReadAsStringAsync();
 		throw new Exception($"CLI Command execution failed: {errorContent}");
 	}
+}
+
+static async Task ManualExecuteCommandsAsync(HttpClient client, string projectName, List<string> commands, string label)
+{
+	await AnsiConsole.Status()
+		.Spinner(Spinner.Known.Dots)
+		.SpinnerStyle(Style.Parse("magenta"))
+		.StartAsync($"[yellow]Executing {label} commands manually...[/]", async ctx =>
+		{
+			try
+			{
+				await ExecuteRemoteCommandsAsync(client, projectName, commands);
+				AnsiConsole.MarkupLine($"[bold green]✓ {label} commands executed successfully on the server.[/]");
+			}
+			catch (Exception ex)
+			{
+				AnsiConsole.MarkupLine($"[bold red]❌ Manual execution of {label} commands failed:[/] {Markup.Escape(ex.Message)}");
+			}
+		});
 }
