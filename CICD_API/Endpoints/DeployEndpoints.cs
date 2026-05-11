@@ -4,11 +4,15 @@ using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.ServiceProcess;
+using System.Text.Json;
 
 namespace CICD_API.Endpoints;
 
 public static class DeployEndpoints
 {
+	private static string GetMetadataPath(string backupDirBase, string projectName)
+		=> Path.Combine(backupDirBase, projectName, "project_metadata.json");
+
 	public static void MapDeployEndpoints(this IEndpointRouteBuilder app)
 	{
 		// Compare local and remote file hashes
@@ -127,65 +131,95 @@ public static class DeployEndpoints
 			return request.Action == "status" ? Results.Ok(statuses) : Results.Ok();
 		});
 
-		// Updated Upload: Receive version and project name
+		// Receive version and project name (Added Finally for strict Temp cleanup)
 		app.MapPost("/api/upload", async (HttpRequest request, [FromQuery] string projectName, [FromQuery] string version, [FromQuery] bool enableBackup, IConfiguration config, ILogger<Program> logger) =>
 		{
 			logger.LogInformation("Upload initiated for project '{ProjectName}', Version: '{Version}'.", projectName, version);
 
-			var allowedDirs = config.GetSection("AllowedDirectories").Get<Dictionary<string, string>>();
-			var backupDirBase = config["BackupDirectory"];
+			string tempZipPath = null; // Defined outside to be accessible in finally block
 
-			if (allowedDirs == null || !allowedDirs.TryGetValue(projectName, out var baseDir))
+			try
 			{
-				logger.LogWarning("Upload failed: Project '{ProjectName}' is not defined.", projectName);
-				return Results.BadRequest("Project not defined.");
-			}
+				var allowedDirs = config.GetSection("AllowedDirectories").Get<Dictionary<string, string>>();
+				var backupDirBase = config["BackupDirectory"];
 
-			// 1. Take Backup
-			if (enableBackup && !string.IsNullOrEmpty(backupDirBase))
-			{
-				var projectBackupDir = Path.Combine(backupDirBase, projectName);
-				Directory.CreateDirectory(projectBackupDir);
-				var backupFilePath = Path.Combine(projectBackupDir, $"backup_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
-
-				if (Directory.Exists(baseDir) && Directory.EnumerateFileSystemEntries(baseDir).Any())
+				if (allowedDirs == null || !allowedDirs.TryGetValue(projectName, out var baseDir))
 				{
-					logger.LogInformation("Creating backup for '{ProjectName}' at '{BackupFilePath}'.", projectName, backupFilePath);
-					ZipFile.CreateFromDirectory(baseDir, backupFilePath);
+					logger.LogWarning("Upload failed: Project '{ProjectName}' is not defined.", projectName);
+					return Results.BadRequest("Project not defined.");
+				}
+
+				// 1. Take Backup
+				if (enableBackup && !string.IsNullOrEmpty(backupDirBase))
+				{
+					var projectBackupDir = Path.Combine(backupDirBase, projectName);
+					Directory.CreateDirectory(projectBackupDir);
+					var backupFilePath = Path.Combine(projectBackupDir, $"backup_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
+
+					if (Directory.Exists(baseDir) && Directory.EnumerateFileSystemEntries(baseDir).Any())
+					{
+						logger.LogInformation("Creating backup for '{ProjectName}' at '{BackupFilePath}'.", projectName, backupFilePath);
+						ZipFile.CreateFromDirectory(baseDir, backupFilePath);
+					}
+				}
+
+				// 2. Extract Files
+				if (request.Form.Files.Count == 0)
+				{
+					return Results.BadRequest("No file uploaded.");
+				}
+
+				var file = request.Form.Files[0];
+				tempZipPath = Path.GetTempFileName();
+				logger.LogInformation("Receiving file '{FileName}', saving to temporary path '{TempPath}'.", file.FileName, tempZipPath);
+
+				using (var stream = new FileStream(tempZipPath, FileMode.Create))
+				{
+					// If connection drops here, exception is thrown and it jumps to catch.
+					await file.CopyToAsync(stream);
+				}
+
+				logger.LogInformation("Extracting uploaded zip to '{BaseDirectory}'.", baseDir);
+				ZipFile.ExtractToDirectory(tempZipPath, baseDir, overwriteFiles: true);
+
+				// 3. Save Version Info
+				if (enableBackup && !string.IsNullOrEmpty(backupDirBase))
+				{
+					var metadataPath = GetMetadataPath(backupDirBase, projectName);
+					var metadata = new
+					{
+						Version = version,
+						DeployDate = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"),
+						IsLockedStorage = true
+					};
+					await File.WriteAllTextAsync(metadataPath, System.Text.Json.JsonSerializer.Serialize(metadata));
+				}
+
+				logger.LogInformation("Deployment completed successfully for project '{ProjectName}'.", projectName);
+				return Results.Ok();
+			}
+			catch (Exception ex)
+			{
+				logger.LogError(ex, "Critical error during upload or extraction: {Message}", ex.Message);
+				return Results.Problem($"Server Error Details: {ex.Message}");
+			}
+			finally
+			{
+				// SAFETY NET: This will ALWAYS run. 
+				// It guarantees that partial/failed uploads don't eat up server disk space.
+				if (!string.IsNullOrEmpty(tempZipPath) && File.Exists(tempZipPath))
+				{
+					try
+					{
+						File.Delete(tempZipPath);
+						logger.LogInformation("Cleaned up temporary file: '{TempPath}'", tempZipPath);
+					}
+					catch (Exception cleanupEx)
+					{
+						logger.LogWarning("Failed to clean up temp file '{TempPath}'. It may be locked. Error: {Message}", tempZipPath, cleanupEx.Message);
+					}
 				}
 			}
-			else
-			{
-				logger.LogInformation("Backup creation is skipped for project '{ProjectName}' as per request.", projectName);
-			}
-
-			// 2. Extract Files
-			if (request.Form.Files.Count == 0)
-			{
-				logger.LogError("Upload failed: No files received for project '{ProjectName}'.", projectName);
-				return Results.BadRequest("No file uploaded.");
-			}
-
-			var file = request.Form.Files[0];
-			var tempZipPath = Path.GetTempFileName();
-			logger.LogInformation("Receiving file '{FileName}', saving to temporary path '{TempPath}'.", file.FileName, tempZipPath);
-
-			using (var stream = new FileStream(tempZipPath, FileMode.Create))
-			{
-				await file.CopyToAsync(stream);
-			}
-
-			logger.LogInformation("Extracting uploaded zip to '{BaseDirectory}'.", baseDir);
-			ZipFile.ExtractToDirectory(tempZipPath, baseDir, overwriteFiles: true);
-			File.Delete(tempZipPath);
-
-			// 3. Save Version Info
-			var versionData = new { Version = version, DeployDate = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") };
-			var versionFilePath = Path.Combine(baseDir, "version.json");
-			await File.WriteAllTextAsync(versionFilePath, System.Text.Json.JsonSerializer.Serialize(versionData));
-
-			logger.LogInformation("Deployment completed successfully for project '{ProjectName}'. New version: {Version}", projectName, version);
-			return Results.Ok();
 		});
 
 		// Get available backups for a project
@@ -256,21 +290,21 @@ public static class DeployEndpoints
 		// Get current version of a project
 		app.MapGet("/api/version", async ([FromQuery] string projectName, IConfiguration config, ILogger<Program> logger) =>
 		{
-			var allowedDirs = config.GetSection("AllowedDirectories").Get<Dictionary<string, string>>();
-			if (allowedDirs == null || !allowedDirs.TryGetValue(projectName, out var baseDir))
+			var backupDirBase = config["BackupDirectory"];
+
+			// Prevent ArgumentNullException if BackupDirectory is missing in appsettings
+			if (string.IsNullOrEmpty(backupDirBase))
 			{
-				logger.LogWarning("Version check failed: Project '{ProjectName}' is not defined.", projectName);
-				return Results.BadRequest("Project not defined.");
+				logger.LogWarning("Version check requested but BackupDirectory is not configured.");
+				return Results.Ok(new { Version = "Not Configured", DeployDate = "-" });
 			}
 
-			var versionFilePath = Path.Combine(baseDir, "version.json");
-			if (!File.Exists(versionFilePath))
-			{
-				logger.LogInformation("Version file not found for project '{ProjectName}'. Returning default info.", projectName);
+			var metadataPath = GetMetadataPath(backupDirBase, projectName);
+
+			if (!File.Exists(metadataPath))
 				return Results.Ok(new { Version = "No version info", DeployDate = "-" });
-			}
 
-			var content = await File.ReadAllTextAsync(versionFilePath);
+			var content = await File.ReadAllTextAsync(metadataPath);
 			return Results.Content(content, "application/json");
 		});
 
@@ -292,14 +326,17 @@ public static class DeployEndpoints
 			{
 				try
 				{
-					logger.LogInformation("Executing command: '{Command}' in directory '{BaseDirectory}'", cmd, baseDir);
+					// Use baseDir if it exists, otherwise fallback to Temp directory
+					string safeWorkingDirectory = Directory.Exists(baseDir) ? baseDir : Path.GetTempPath();
+
+					logger.LogInformation("Executing command: '{Command}' in directory '{BaseDirectory}'", cmd, safeWorkingDirectory);
 					bool isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
 
 					var processInfo = new System.Diagnostics.ProcessStartInfo
 					{
 						FileName = isWindows ? "cmd.exe" : "/bin/bash",
 						Arguments = isWindows ? $"/c {cmd}" : $"-c \"{cmd}\"",
-						WorkingDirectory = baseDir,
+						WorkingDirectory = safeWorkingDirectory,
 						RedirectStandardOutput = true,
 						RedirectStandardError = true,
 						UseShellExecute = false,
