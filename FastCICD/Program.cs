@@ -30,7 +30,7 @@ if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(apiKey) || 
 var handler = new HmacDelegatingHandler(apiKey, new HttpClientHandler());
 using var httpClient = new HttpClient(handler) { BaseAddress = new Uri(endpoint) };
 httpClient.DefaultRequestHeaders.Add("X-Api-Key", apiKey);
-httpClient.Timeout = TimeSpan.FromMinutes(10);
+httpClient.Timeout = TimeSpan.FromMinutes(60);
 
 while (true)
 {
@@ -388,15 +388,23 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 					.AddColumn(new TableColumn("[cyan]Directory[/]"))
 					.AddColumn(new TableColumn("[green]File Name[/]"));
 
-				foreach (var file in deltaFiles)
+				int maxDisplay = 100;
+				var displayFiles = deltaFiles.Take(maxDisplay).ToList();
+
+				foreach (var file in displayFiles)
 				{
 					var dir = Path.GetDirectoryName(file);
 					var name = Path.GetFileName(file);
 
 					table.AddRow(
-						string.IsNullOrEmpty(dir) ? "[grey]/ (Root)[/]" : $"[white]{dir}[/]",
-						$"[yellow]{name}[/]"
+						string.IsNullOrEmpty(dir) ? "[grey]/ (Root)[/]" : $"[white]{Markup.Escape(dir)}[/]",
+						$"[yellow]{Markup.Escape(name)}[/]"
 					);
+				}
+
+				if (deltaFiles.Count > maxDisplay)
+				{
+					table.AddRow("[grey]...[/]", $"[grey]... and {deltaFiles.Count - maxDisplay} more files hidden for performance.[/]");
 				}
 
 				AnsiConsole.Clear();
@@ -474,7 +482,9 @@ static Dictionary<string, string> GetLocalFileHashes(string basePath, List<strin
 			var normalizedIgnored = ignored.Replace('/', '\\');
 
 			return normalizedRelativePath.Equals(normalizedIgnored, StringComparison.OrdinalIgnoreCase) ||
-				   normalizedRelativePath.StartsWith(normalizedIgnored + "\\", StringComparison.OrdinalIgnoreCase);
+							   normalizedRelativePath.StartsWith(normalizedIgnored + "\\", StringComparison.OrdinalIgnoreCase) ||
+							   normalizedRelativePath.Contains("\\" + normalizedIgnored + "\\", StringComparison.OrdinalIgnoreCase) ||
+							   normalizedRelativePath.EndsWith("\\" + normalizedIgnored, StringComparison.OrdinalIgnoreCase);
 		});
 
 		if (isIgnored)
@@ -542,7 +552,20 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 	{
 		if (Directory.Exists(tempDir))
 		{
-			Directory.Delete(tempDir, true);
+			try
+			{
+				// Remove ReadOnly attributes so Directory.Delete doesn't crash and mask real upload errors
+				var di = new DirectoryInfo(tempDir);
+				foreach (var info in di.GetFileSystemInfos("*", SearchOption.AllDirectories))
+				{
+					info.Attributes &= ~FileAttributes.ReadOnly;
+				}
+				Directory.Delete(tempDir, true);
+			}
+			catch
+			{
+				// We silently ignore cleanup errors so the REAL upload error is thrown to the UI
+			}
 		}
 
 		if (File.Exists(zipPath))
