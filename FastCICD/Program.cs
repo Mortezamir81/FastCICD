@@ -87,6 +87,11 @@ static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig projec
 		if (project.PostDeployCommands.Count > 0)
 			menuChoices.Add(MenuOptions.RunPostDeploy);
 
+		if (project.LocalPreDeployCommands.Count > 0)
+			menuChoices.Add(MenuOptions.RunLocalPreDeploy);
+		if (project.LocalPostDeployCommands.Count > 0)
+			menuChoices.Add(MenuOptions.RunLocalPostDeploy);
+
 		if (project.EnableRollback)
 		{
 			menuChoices.Add(MenuOptions.Rollback);
@@ -130,6 +135,14 @@ static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig projec
 				await ManualExecuteCommandsAsync(client, project.Name, project.PostDeployCommands, "Post-Deploy");
 				break;
 
+			case MenuOptions.RunLocalPreDeploy:
+				await ManualExecuteLocalCommandsAsync(project.LocalPreDeployCommands, "Local Pre-Deploy");
+				break;
+
+			case MenuOptions.RunLocalPostDeploy:
+				await ManualExecuteLocalCommandsAsync(project.LocalPostDeployCommands, "Local Post-Deploy");
+				break;
+
 			case MenuOptions.Rollback:
 				await HandleRollbackAsync(client, project);
 				break;
@@ -152,7 +165,7 @@ static async Task ShowCurrentVersionAsync(HttpClient client, string projectName)
 {
 	try
 	{
-		var res = await client.GetAsync($"/api/version?projectName={projectName}");
+		var res = await client.GetAsync($"api/version?projectName={projectName}");
 		await res.EnsureSuccessWithDetailsAsync();
 
 		var data = await res.Content.ReadFromJsonAsync<VersionResponse>();
@@ -181,7 +194,7 @@ static async Task CheckServicesStatusAsync(HttpClient client, List<string> servi
 
 	try
 	{
-		var res = await client.PostAsJsonAsync("/api/services", new { Services = services, Action = "status" });
+		var res = await client.PostAsJsonAsync("api/services", new { Services = services, Action = "status" });
 		await res.EnsureSuccessWithDetailsAsync();
 
 		var statuses = await res.Content.ReadFromJsonAsync<Dictionary<string, string>>();
@@ -216,7 +229,7 @@ static async Task ManageServicesAsync(HttpClient client, List<string> services, 
 	{
 		try
 		{
-			var res = await client.PostAsJsonAsync("/api/services", new { Services = services, Action = action });
+			var res = await client.PostAsJsonAsync("api/services", new { Services = services, Action = action });
 			await res.EnsureSuccessWithDetailsAsync();
 			AnsiConsole.MarkupLine($"[bold green]✓ Services successfully {action}ed.[/]");
 		}
@@ -231,7 +244,7 @@ static async Task HandleRollbackAsync(HttpClient client, ProjectConfig project)
 {
 	try
 	{
-		var res = await client.GetAsync($"/api/backups?projectName={project.Name}");
+		var res = await client.GetAsync($"api/backups?projectName={project.Name}");
 		await res.EnsureSuccessWithDetailsAsync();
 
 		var backups = await res.Content.ReadFromJsonAsync<List<string>>();
@@ -263,17 +276,17 @@ static async Task HandleRollbackAsync(HttpClient client, ProjectConfig project)
 			if (project.ServicesToManage.Count != 0)
 			{
 				ctx.Status("[red]Stopping Services...[/]");
-				await client.PostAsJsonAsync("/api/services", new { Services = project.ServicesToManage, Action = "stop" });
+				await client.PostAsJsonAsync("api/services", new { Services = project.ServicesToManage, Action = "stop" });
 			}
 
 			ctx.Status("[blue]Restoring Backup Files...[/]");
-			var rollbackRes = await client.PostAsJsonAsync("/api/rollback", new { ProjectName = project.Name, BackupFileName = selectedBackup });
+			var rollbackRes = await client.PostAsJsonAsync("api/rollback", new { ProjectName = project.Name, BackupFileName = selectedBackup });
 			await rollbackRes.EnsureSuccessWithDetailsAsync();
 
 			if (project.ServicesToManage.Count != 0)
 			{
 				ctx.Status("[green]Restarting Services...[/]");
-				await client.PostAsJsonAsync("/api/services", new { Services = project.ServicesToManage, Action = "start" });
+				await client.PostAsJsonAsync("api/services", new { Services = project.ServicesToManage, Action = "start" });
 			}
 
 			AnsiConsole.WriteLine();
@@ -289,13 +302,6 @@ static async Task HandleRollbackAsync(HttpClient client, ProjectConfig project)
 
 static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectConfig project)
 {
-	if (!Directory.Exists(project.LocalSourcePath))
-	{
-		AnsiConsole.MarkupLine($"[bold red]❌ Deployment Aborted:[/] The local directory [yellow]'{project.LocalSourcePath}'[/] was not found.");
-		AnsiConsole.MarkupLine("[grey]Please check your appsettings.json and ensure 'LocalSourcePath' is correct.[/]");
-		return;
-	}
-
 	string version = ""; // Default empty version for when rollback is disabled
 
 	if (project.EnableRollback)
@@ -304,7 +310,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 		string currentVersion = "Unknown";
 		try
 		{
-			var versionRes = await httpClient.GetAsync($"/api/version?projectName={project.Name}");
+			var versionRes = await httpClient.GetAsync($"api/version?projectName={project.Name}");
 			if (versionRes.IsSuccessStatusCode)
 			{
 				var data = await versionRes.Content.ReadFromJsonAsync<VersionResponse>();
@@ -339,6 +345,18 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 
 			try
 			{
+				if (project.LocalPreDeployCommands.Count != 0)
+				{
+					ctx.Status("[magenta]Executing LOCAL Pre-Deploy commands...[/]");
+					await ExecuteLocalCommandsAsync(project.LocalPreDeployCommands, "Local Pre-Deploy", ctx);
+					AnsiConsole.MarkupLine("[grey]✓ Local Pre-Deploy commands executed successfully.[/]");
+				}
+
+				if (!Directory.Exists(project.LocalSourcePath))
+				{
+					throw new Exception($"The local directory '{project.LocalSourcePath}' was not found. Did your publish command output to the correct path?");
+				}
+
 				if (project.PreDeployCommands.Count != 0)
 				{
 					ctx.Status("[magenta]Executing Pre-Deploy CLI Commands on server...[/]");
@@ -353,7 +371,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 				if (project.ServicesToManage.Count != 0)
 				{
 					ctx.Status("[red]Stopping Windows Services on remote server...[/]");
-					var stopRes = await httpClient.PostAsJsonAsync("/api/services",
+					var stopRes = await httpClient.PostAsJsonAsync("api/services",
 						new { Services = project.ServicesToManage, Action = "stop" });
 					await stopRes.EnsureSuccessWithDetailsAsync();
 
@@ -363,7 +381,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 
 				ctx.Status("[blue]Comparing with server state...[/]");
 
-				var response = await httpClient.PostAsJsonAsync("/api/compare",
+				var response = await httpClient.PostAsJsonAsync("api/compare",
 					new { ProjectName = project.Name, FileHashes = localFiles });
 				await response.EnsureSuccessWithDetailsAsync();
 
@@ -428,7 +446,25 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 			}
 			finally
 			{
-				// 1. Evaluate and execute Post-Deploy commands safely
+				// Local Post-Deploy commands
+				bool shouldRunLocalPostDeploy = project.LocalPostDeployCommands.Count != 0 &&
+												(project.AlwaysRunPostDeployCommands || wasDeltaUploadedSuccessfully);
+
+				if (shouldRunLocalPostDeploy)
+				{
+					ctx.Status("[magenta]Executing LOCAL Post-Deploy commands...[/]");
+					try
+					{
+						await ExecuteLocalCommandsAsync(project.LocalPostDeployCommands, "Local Post-Deploy", ctx);
+						AnsiConsole.MarkupLine("[grey]✓ Local Post-Deploy commands executed successfully.[/]");
+					}
+					catch (Exception localEx)
+					{
+						AnsiConsole.MarkupLine($"[bold red]❌ Local Post-Deploy commands failed:[/] {Markup.Escape(localEx.Message)}");
+					}
+				}
+
+				// Evaluate and execute Post-Deploy commands safely
 				bool shouldRunPostDeploy = project.PostDeployCommands.Count != 0 &&
 										   (project.AlwaysRunPostDeployCommands || wasDeltaUploadedSuccessfully);
 
@@ -453,7 +489,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 					ctx.Status("[green]Executing Safety Net: Restarting Windows Services...[/]");
 					try
 					{
-						var startRes = await httpClient.PostAsJsonAsync("/api/services",
+						var startRes = await httpClient.PostAsJsonAsync("api/services",
 							new { Services = project.ServicesToManage, Action = "start" });
 						await startRes.EnsureSuccessWithDetailsAsync();
 						AnsiConsole.MarkupLine("[grey]Services safely restarted.[/]");
@@ -543,7 +579,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 
 				form.Add(progressContent, "file", "delta.zip");
 
-				var response = await client.PostAsync($"/api/upload?projectName={Uri.EscapeDataString(project.Name)}&version={Uri.EscapeDataString(version)}&enableBackup={project.EnableRollback}", form);
+				var response = await client.PostAsync($"api/upload?projectName={Uri.EscapeDataString(project.Name)}&version={Uri.EscapeDataString(version)}&enableBackup={project.EnableRollback}", form);
 				await response.EnsureSuccessWithDetailsAsync();
 			}
 		}
@@ -577,7 +613,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 
 static async Task ExecuteRemoteCommandsAsync(HttpClient client, string projectName, List<string> commands)
 {
-	var res = await client.PostAsJsonAsync("/api/execute", new { ProjectName = projectName, Commands = commands });
+	var res = await client.PostAsJsonAsync("api/execute", new { ProjectName = projectName, Commands = commands });
 
 	if (!res.IsSuccessStatusCode)
 	{
@@ -601,6 +637,69 @@ static async Task ManualExecuteCommandsAsync(HttpClient client, string projectNa
 			catch (Exception ex)
 			{
 				AnsiConsole.MarkupLine($"[bold red]❌ Manual execution of {label} commands failed:[/] {Markup.Escape(ex.Message)}");
+			}
+		});
+}
+
+static async Task ExecuteLocalCommandsAsync(List<LocalCommandConfig> commands, string label, StatusContext? ctx = null)
+{
+	int index = 0;
+	foreach (var cmd in commands)
+	{
+		index++;
+		var statusText = $"[magenta]{label} ({index}/{commands.Count}):[/] [white]{Markup.Escape(cmd.Command)}[/]";
+		ctx?.Status(statusText);
+		AnsiConsole.MarkupLine($"[grey]→ Running:[/] [white]{Markup.Escape(cmd.Command)}[/]");
+
+		var psi = new System.Diagnostics.ProcessStartInfo
+		{
+			FileName = "cmd.exe",
+			Arguments = $"/c {cmd.Command}",
+			WorkingDirectory = string.IsNullOrWhiteSpace(cmd.WorkingDirectory)
+				? Directory.GetCurrentDirectory()
+				: cmd.WorkingDirectory,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+			UseShellExecute = false,
+			CreateNoWindow = true
+		};
+
+		using var process = System.Diagnostics.Process.Start(psi)
+			?? throw new Exception($"Could not start local command: '{cmd.Command}'");
+
+		var stdOutTask = process.StandardOutput.ReadToEndAsync();
+		var stdErrTask = process.StandardError.ReadToEndAsync();
+		await process.WaitForExitAsync();
+
+		var stdOut = await stdOutTask;
+		var stdErr = await stdErrTask;
+
+		if (process.ExitCode != 0)
+		{
+			var details = string.IsNullOrWhiteSpace(stdErr) ? stdOut : stdErr;
+			var lastLines = string.Join("\n", details.Split('\n').TakeLast(15));
+			throw new Exception($"Local command #{index} failed (ExitCode {process.ExitCode}): '{cmd.Command}'\n--- Output ---\n{lastLines}");
+		}
+
+		AnsiConsole.MarkupLine($"[grey]  ✓ ({index}/{commands.Count}) Done.[/]");
+	}
+}
+
+static async Task ManualExecuteLocalCommandsAsync(List<LocalCommandConfig> commands, string label)
+{
+	await AnsiConsole.Status()
+		.Spinner(Spinner.Known.Dots)
+		.SpinnerStyle(Style.Parse("magenta"))
+		.StartAsync($"[yellow]Executing {label} commands locally...[/]", async ctx =>
+		{
+			try
+			{
+				await ExecuteLocalCommandsAsync(commands, label, ctx);
+				AnsiConsole.MarkupLine($"[bold green]✓ {label} commands executed successfully.[/]");
+			}
+			catch (Exception ex)
+			{
+				AnsiConsole.MarkupLine($"[bold red]❌ {label} commands failed:[/] {Markup.Escape(ex.Message)}");
 			}
 		});
 }
