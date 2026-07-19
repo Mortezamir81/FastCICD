@@ -1,0 +1,28 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.12.35707.178 d17.12
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "FastCICD", "FastCICD.csproj", "{883AF5FA-0964-458B-AA98-6BAA8CD62448}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CICD_API", "..\CICD_API\CICD_API.csproj", "{AAADA2D0-02AA-4A57-B8C5-B93D3A44F16B}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{883AF5FA-0964-458B-AA98-6BAA8CD62448}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{883AF5FA-0964-458B-AA98-6BAA8CD62448}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{883AF5FA-0964-458B-AA98-6BAA8CD62448}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{883AF5FA-0964-458B-AA98-6BAA8CD62448}.Release|Any CPU.Build.0 = Release|Any CPU
+		{AAADA2D0-02AA-4A57-B8C5-B93D3A44F16B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AAADA2D0-02AA-4A57-B8C5-B93D3A44F16B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AAADA2D0-02AA-4A57-B8C5-B93D3A44F16B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AAADA2D0-02AA-4A57-B8C5-B93D3A44F16B}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+EndGlobal
