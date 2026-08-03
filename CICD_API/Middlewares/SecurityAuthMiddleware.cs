@@ -22,6 +22,7 @@ public class SecurityAuthMiddleware
 		var allowedIpStr = _config["AllowedClientIp"];
 		var expectedKey = _config["SecurityKey"];
 		var remoteIp = context.Connection.RemoteIpAddress;
+		var requestValidityMinutes = GetRequestValidityMinutes(context.Request.Path);
 
 		_logger.LogInformation("Remote IP Requested: {RemoteIp}", remoteIp);
 
@@ -69,10 +70,17 @@ public class SecurityAuthMiddleware
 			}
 
 			var requestTime = DateTimeOffset.FromUnixTimeSeconds(timestamp);
-			if (Math.Abs((DateTimeOffset.UtcNow - requestTime).TotalMinutes) > 5)
+			var requestAge = DateTimeOffset.UtcNow - requestTime;
+			if (Math.Abs(requestAge.TotalMinutes) > requestValidityMinutes)
 			{
+				_logger.LogWarning(
+					"Rejected expired HMAC request for {Path}. Age: {RequestAgeMinutes:F2} minutes; allowed: {AllowedMinutes} minutes.",
+					context.Request.Path,
+					requestAge.TotalMinutes,
+					requestValidityMinutes);
 				context.Response.StatusCode = StatusCodes.Status401Unauthorized;
-				await context.Response.WriteAsync("Unauthorized: Request has expired. Please check system clock.");
+				await context.Response.WriteAsync(
+					$"Unauthorized: Request has expired. Allowed age is {requestValidityMinutes} minutes. Please check system clocks.");
 				return;
 			}
 
@@ -81,7 +89,9 @@ public class SecurityAuthMiddleware
 			using var hmac = new HMACSHA256(keyBytes);
 			var serverSignature = Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(payload)));
 
-			if (serverSignature == clientSignature)
+			var providedSignatureBytes = Encoding.UTF8.GetBytes(clientSignature.ToString());
+			var expectedSignatureBytes = Encoding.UTF8.GetBytes(serverSignature);
+			if (CryptographicOperations.FixedTimeEquals(providedSignatureBytes, expectedSignatureBytes))
 			{
 				await _next(context);
 				return;
@@ -91,5 +101,16 @@ public class SecurityAuthMiddleware
 		// 4. If neither IP matched nor valid HMAC was provided
 		context.Response.StatusCode = StatusCodes.Status403Forbidden;
 		await context.Response.WriteAsync("Access Denied: Invalid IP and no valid security signature provided.");
+	}
+
+	private int GetRequestValidityMinutes(PathString path)
+	{
+		var settingKey = path.StartsWithSegments("/api/upload")
+			? "UploadHmacValidityMinutes"
+			: "HmacValidityMinutes";
+
+		var defaultValue = settingKey == "UploadHmacValidityMinutes" ? 120 : 5;
+		var configuredValue = _config.GetValue<int?>(settingKey);
+		return configuredValue is > 0 and <= 1440 ? configuredValue.Value : defaultValue;
 	}
 }

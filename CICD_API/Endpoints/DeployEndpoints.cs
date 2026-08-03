@@ -5,6 +5,7 @@ using System.IO.Compression;
 using System.Security.Cryptography;
 using System.ServiceProcess;
 using System.Text.Json;
+using CICD_API.Uploads;
 
 namespace CICD_API.Endpoints;
 
@@ -15,6 +16,8 @@ public static class DeployEndpoints
 
 	public static void MapDeployEndpoints(this IEndpointRouteBuilder app)
 	{
+		MapResumableUploadEndpoints(app);
+
 		// Compare local and remote file hashes
 		app.MapPost("/api/compare", async ([FromBody] CompareRequest request, IConfiguration config, ILogger<Program> logger) =>
 		{
@@ -426,5 +429,191 @@ public static class DeployEndpoints
 
 			return Results.Ok(results);
 		});
+	}
+
+	private static void MapResumableUploadEndpoints(IEndpointRouteBuilder app)
+	{
+		app.MapPost("/api/upload/sessions", (CreateUploadSessionRequest request, IConfiguration config, ILogger<Program> logger) =>
+		{
+			var allowedDirs = config.GetSection("AllowedDirectories").Get<Dictionary<string, string>>();
+			var maxUploadBytes = config.GetValue<long?>("MaxUploadBytes") ?? 10L * 1024 * 1024 * 1024;
+			var maxChunkSize = config.GetValue<int?>("UploadChunkSizeBytes") ?? 8 * 1024 * 1024;
+
+			if (allowedDirs == null || !allowedDirs.ContainsKey(request.ProjectName))
+				return Results.BadRequest("Project not defined.");
+			if (request.TotalBytes <= 0 || request.TotalBytes > maxUploadBytes)
+				return Results.BadRequest("Upload size is invalid or exceeds the server limit.");
+			if (request.ChunkSize <= 0)
+				return Results.BadRequest("Chunk size must be positive.");
+			if (string.IsNullOrWhiteSpace(request.FileHash) || request.FileHash.Length != 64)
+				return Results.BadRequest("A SHA-256 file hash is required.");
+
+			var normalizedRequest = request with { ChunkSize = Math.Min(request.ChunkSize, maxChunkSize) };
+			var session = UploadSessionStore.Create(normalizedRequest);
+			logger.LogInformation("Created resumable upload session {UploadId} for project '{ProjectName}'.", session.Metadata.UploadId, request.ProjectName);
+			return Results.Ok(new
+			{
+				UploadId = session.Metadata.UploadId,
+				ChunkSize = session.Metadata.ChunkSize,
+				TotalChunks = GetTotalChunks(session.Metadata)
+			});
+		});
+
+		app.MapGet("/api/upload/sessions/{uploadId}", (string uploadId) =>
+		{
+			var session = UploadSessionStore.Get(uploadId);
+			if (session == null)
+				return Results.NotFound("Upload session not found.");
+
+			lock (session.SyncRoot)
+			{
+				return Results.Ok(new
+				{
+					UploadId = session.Metadata.UploadId,
+					TotalBytes = session.Metadata.TotalBytes,
+					ChunkSize = session.Metadata.ChunkSize,
+					TotalChunks = GetTotalChunks(session.Metadata),
+					UploadedChunks = session.Metadata.UploadedChunks.Order().ToArray()
+				});
+			}
+		});
+
+		app.MapPut("/api/upload/sessions/{uploadId}/chunks/{chunkIndex:int}", async (string uploadId, int chunkIndex, HttpRequest request, ILogger<Program> logger) =>
+		{
+			var session = UploadSessionStore.Get(uploadId);
+			if (session == null)
+				return Results.NotFound("Upload session not found.");
+
+			var metadata = session.Metadata;
+			var totalChunks = GetTotalChunks(metadata);
+			if (chunkIndex < 0 || chunkIndex >= totalChunks)
+				return Results.BadRequest("Chunk index is outside the upload range.");
+
+			var expectedLength = GetChunkLength(metadata, chunkIndex);
+			if (request.ContentLength != expectedLength)
+				return Results.BadRequest($"Expected chunk length {expectedLength}, received {request.ContentLength ?? 0}.");
+
+			lock (session.SyncRoot)
+			{
+				if (metadata.UploadedChunks.Contains(chunkIndex))
+					return Results.Ok(new { ChunkIndex = chunkIndex, AlreadyUploaded = true });
+			}
+
+			try
+			{
+				long offset = (long)chunkIndex * metadata.ChunkSize;
+				await using var stream = new FileStream(session.PartFilePath, FileMode.Open, FileAccess.Write, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+				stream.Position = offset;
+				await request.Body.CopyToAsync(stream, request.HttpContext.RequestAborted);
+				await stream.FlushAsync(request.HttpContext.RequestAborted);
+
+				lock (session.SyncRoot)
+				{
+					if (!metadata.UploadedChunks.Contains(chunkIndex))
+						metadata.UploadedChunks.Add(chunkIndex);
+					UploadSessionStore.Save(session);
+				}
+
+				return Results.Ok(new { ChunkIndex = chunkIndex, AlreadyUploaded = false });
+			}
+			catch (OperationCanceledException)
+			{
+				return Results.StatusCode(StatusCodes.Status499ClientClosedRequest);
+			}
+			catch (Exception ex)
+			{
+				logger.LogError(ex, "Failed to write chunk {ChunkIndex} for upload {UploadId}.", chunkIndex, uploadId);
+				return Results.Problem("The upload chunk could not be saved.");
+			}
+		});
+
+		app.MapPost("/api/upload/sessions/{uploadId}/complete", async (string uploadId, IConfiguration config, ILogger<Program> logger) =>
+		{
+			var session = UploadSessionStore.Get(uploadId);
+			if (session == null)
+				return Results.NotFound("Upload session not found.");
+
+			lock (session.SyncRoot)
+			{
+				if (session.Metadata.UploadedChunks.Count != GetTotalChunks(session.Metadata))
+					return Results.Conflict("The upload is incomplete.");
+			}
+
+			try
+			{
+				await using (var stream = new FileStream(session.PartFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+				{
+					using var sha256 = SHA256.Create();
+					var actualHash = Convert.ToHexStringLower(await sha256.ComputeHashAsync(stream));
+					if (!actualHash.Equals(session.Metadata.FileHash, StringComparison.OrdinalIgnoreCase))
+						return Results.Problem("Upload integrity verification failed.", statusCode: StatusCodes.Status422UnprocessableEntity);
+				}
+
+				await ProcessUploadedZipAsync(session.PartFilePath, session.Metadata.ProjectName, session.Metadata.Version, session.Metadata.EnableBackup, config, logger);
+				UploadSessionStore.Delete(session);
+				return Results.Ok();
+			}
+			catch (Exception ex)
+			{
+				logger.LogError(ex, "Failed to complete resumable upload {UploadId}.", uploadId);
+				return Results.Problem($"Server Error Details: {ex.Message}");
+			}
+		});
+	}
+
+	private static int GetTotalChunks(UploadSessionMetadata metadata)
+		=> checked((int)((metadata.TotalBytes + metadata.ChunkSize - 1) / metadata.ChunkSize));
+
+	private static long GetChunkLength(UploadSessionMetadata metadata, int chunkIndex)
+	{
+		var offset = (long)chunkIndex * metadata.ChunkSize;
+		return Math.Min(metadata.ChunkSize, metadata.TotalBytes - offset);
+	}
+
+	private static async Task ProcessUploadedZipAsync(string zipPath, string projectName, string version, bool enableBackup, IConfiguration config, ILogger<Program> logger)
+	{
+		var allowedDirs = config.GetSection("AllowedDirectories").Get<Dictionary<string, string>>();
+		var backupDirBase = config["BackupDirectory"];
+		if (allowedDirs == null || !allowedDirs.TryGetValue(projectName, out var baseDir))
+			throw new InvalidOperationException("Project not defined.");
+
+		if (enableBackup && !string.IsNullOrEmpty(backupDirBase))
+		{
+			var projectBackupDir = Path.Combine(backupDirBase, projectName);
+			Directory.CreateDirectory(projectBackupDir);
+			var backupFilePath = Path.Combine(projectBackupDir, $"backup_{DateTime.Now:yyyyMMdd_HHmmss}.zip");
+			if (Directory.Exists(baseDir) && Directory.EnumerateFileSystemEntries(baseDir).Any())
+			{
+				logger.LogInformation("Creating backup for '{ProjectName}' at '{BackupFilePath}'.", projectName, backupFilePath);
+				ZipFile.CreateFromDirectory(baseDir, backupFilePath);
+			}
+		}
+
+		logger.LogInformation("Extracting uploaded zip to '{BaseDirectory}'.", baseDir);
+		using var archive = ZipFile.OpenRead(zipPath);
+		var normalizedBaseDir = Path.GetFullPath(baseDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+		foreach (var entry in archive.Entries)
+		{
+			var destinationPath = Path.GetFullPath(Path.Combine(normalizedBaseDir, entry.FullName));
+			if (!destinationPath.StartsWith(normalizedBaseDir, StringComparison.OrdinalIgnoreCase))
+				throw new InvalidDataException("The upload contains an invalid path.");
+
+			if (string.IsNullOrEmpty(entry.Name))
+				Directory.CreateDirectory(destinationPath);
+			else
+			{
+				Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+				if (File.Exists(destinationPath))
+					File.SetAttributes(destinationPath, File.GetAttributes(destinationPath) & ~FileAttributes.ReadOnly);
+				entry.ExtractToFile(destinationPath, overwrite: true);
+			}
+		}
+
+		if (enableBackup && !string.IsNullOrEmpty(backupDirBase))
+		{
+			var metadataPath = GetMetadataPath(backupDirBase, projectName);
+			var metadata = new { Version = version, DeployDate = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), IsLockedStorage = true };
+			await File.WriteAllTextAsync(metadataPath, JsonSerializer.Serialize(metadata));
+		}
 	}
 }

@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Net.Http.Json;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using FastCICD;
 using Microsoft.Extensions.Configuration;
@@ -540,6 +541,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 {
 	var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
 	var zipPath = tempDir + ".zip";
+	var preserveUploadArtifact = false;
 
 	try
 	{
@@ -560,33 +562,23 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 		// 2. Update UI to show we are switching to Upload mode
 		ctx.Status("[blue]Starting upload process...[/]");
 
-		using (var form = new MultipartFormDataContent())
+		try
 		{
-			using (var fileStream = new FileStream(zipPath, FileMode.Open, FileAccess.Read, FileShare.Read))
-			{
-				// Wrap the stream with our custom progress tracker
-				var progressContent = new ProgressStreamContent(fileStream, (uploaded, total) =>
-				{
-					int percent = total > 0 ? (int) ((double) uploaded / total * 100) : 0;
-
-					// Convert bytes to Megabytes for better UX
-					double uploadedMb = Math.Round((double) uploaded / 1048576, 2);
-					double totalMb = Math.Round((double) total / 1048576, 2);
-
-					// Dynamically update the spinner text with live progress
-					ctx.Status($"[yellow]Uploading delta.zip... [bold green]{percent}%[/] ([blue]{uploadedMb} MB[/] / [blue]{totalMb} MB[/])[/]");
-				});
-
-				form.Add(progressContent, "file", "delta.zip");
-
-				var response = await client.PostAsync($"api/upload?projectName={Uri.EscapeDataString(project.Name)}&version={Uri.EscapeDataString(version)}&enableBackup={project.EnableRollback}", form);
-				await response.EnsureSuccessWithDetailsAsync();
-			}
+			await UploadResumableAsync(client, project, version, zipPath, ctx);
+		}
+		catch
+		{
+			preserveUploadArtifact = true;
+			throw;
 		}
 	}
 	finally
 	{
-		if (Directory.Exists(tempDir))
+		if (preserveUploadArtifact)
+		{
+			AnsiConsole.MarkupLine("[yellow]Upload paused. The local upload artifact is preserved for a future resume.[/]");
+		}
+		else if (Directory.Exists(tempDir))
 		{
 			try
 			{
@@ -604,7 +596,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 			}
 		}
 
-		if (File.Exists(zipPath))
+		if (!preserveUploadArtifact && File.Exists(zipPath))
 		{
 			File.Delete(zipPath);
 		}
@@ -702,4 +694,186 @@ static async Task ManualExecuteLocalCommandsAsync(List<LocalCommandConfig> comma
 				AnsiConsole.MarkupLine($"[bold red]❌ {label} commands failed:[/] {Markup.Escape(ex.Message)}");
 			}
 		});
+}
+
+static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string version, string zipPath, StatusContext ctx)
+{
+	const int chunkSize = 8 * 1024 * 1024;
+	var totalBytes = new FileInfo(zipPath).Length;
+	var fileHash = await ComputeFileHashAsync(zipPath);
+	var manifestPath = GetPendingUploadManifestPath(project, version, fileHash);
+	var uploadZipPath = zipPath;
+	PendingUploadManifest? manifest = await LoadPendingUploadManifestAsync(manifestPath);
+	UploadSessionResponse? session = null;
+
+	if (manifest != null && File.Exists(manifest.ZipPath))
+	{
+		ctx.Status("[yellow]Resuming previous upload session...[/]");
+		using var existingStatusResponse = await client.GetAsync($"api/upload/sessions/{manifest.UploadId}");
+		if (existingStatusResponse.IsSuccessStatusCode)
+		{
+			var existingStatus = await existingStatusResponse.Content.ReadFromJsonAsync<UploadSessionStatusResponse>();
+			if (existingStatus != null && existingStatus.TotalBytes == new FileInfo(manifest.ZipPath).Length &&
+				string.Equals(await ComputeFileHashAsync(manifest.ZipPath), fileHash, StringComparison.OrdinalIgnoreCase))
+			{
+				session = new UploadSessionResponse(manifest.UploadId, existingStatus.ChunkSize, existingStatus.TotalChunks);
+				uploadZipPath = manifest.ZipPath;
+				AnsiConsole.MarkupLine($"[cyan]Resuming upload session:[/] [yellow]{existingStatus.UploadedChunks.Length}/{existingStatus.TotalChunks} chunks already uploaded.[/]");
+			}
+		}
+	}
+
+	if (session == null)
+	{
+		if (manifest != null)
+			File.Delete(manifestPath);
+
+		using var sessionResponse = await client.PostAsJsonAsync("api/upload/sessions", new CreateUploadSessionRequest(
+			project.Name, version, project.EnableRollback, totalBytes, chunkSize, fileHash));
+		await sessionResponse.EnsureSuccessWithDetailsAsync();
+		session = await sessionResponse.Content.ReadFromJsonAsync<UploadSessionResponse>()
+			?? throw new InvalidOperationException("The server did not return an upload session.");
+		manifest = new PendingUploadManifest
+		{
+			UploadId = session.UploadId,
+			ProjectName = project.Name,
+			Version = version,
+			EnableBackup = project.EnableRollback,
+			FileHash = fileHash,
+			ZipPath = zipPath
+		};
+		await SavePendingUploadManifestAsync(manifestPath, manifest);
+		AnsiConsole.MarkupLine($"[cyan]Started new upload session:[/] [yellow]0/{session.TotalChunks} chunks uploaded.[/]");
+	}
+
+	using var statusResponse = await client.GetAsync($"api/upload/sessions/{session.UploadId}");
+	await statusResponse.EnsureSuccessWithDetailsAsync();
+	var status = await statusResponse.Content.ReadFromJsonAsync<UploadSessionStatusResponse>()
+		?? throw new InvalidOperationException("The server did not return upload status.");
+
+	var completedChunks = status.UploadedChunks.ToHashSet();
+	long completedBytes = completedChunks.Sum(index => Math.Min((long)session.ChunkSize, totalBytes - (long)index * session.ChunkSize));
+	var totalChunks = session.TotalChunks;
+	var lastSpeedUpdate = Stopwatch.GetTimestamp();
+	long lastSpeedBytes = completedBytes;
+	double smoothedBytesPerSecond = 0;
+
+	for (var chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++)
+	{
+		if (completedChunks.Contains(chunkIndex))
+			continue;
+
+		var offset = (long)chunkIndex * session.ChunkSize;
+		var length = Math.Min((long)session.ChunkSize, totalBytes - offset);
+		var uploadedBeforeChunk = completedBytes;
+		var sent = false;
+
+		for (var attempt = 1; attempt <= 5 && !sent; attempt++)
+		{
+			try
+			{
+				ctx.Status($"Uploading chunk {chunkIndex + 1}/{totalChunks} ({completedChunks.Count}/{totalChunks} completed)...");
+				using var fileStream = new FileStream(uploadZipPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+				fileStream.Position = offset;
+				var lastProgressUpdate = Stopwatch.GetTimestamp();
+				using var content = new StreamContent(new BoundedReadStream(fileStream, length, chunkRead =>
+				{
+					if (chunkRead != length && Stopwatch.GetElapsedTime(lastProgressUpdate) < TimeSpan.FromMilliseconds(250))
+						return;
+					lastProgressUpdate = Stopwatch.GetTimestamp();
+					var uploaded = uploadedBeforeChunk + chunkRead;
+					var percent = totalBytes > 0 ? (int)((double)uploaded / totalBytes * 100) : 0;
+					var elapsed = Stopwatch.GetElapsedTime(lastSpeedUpdate).TotalSeconds;
+					if (elapsed > 0)
+					{
+						var instantBytesPerSecond = (uploaded - lastSpeedBytes) / elapsed;
+						smoothedBytesPerSecond = smoothedBytesPerSecond <= 0
+							? instantBytesPerSecond
+							: (smoothedBytesPerSecond * 0.7) + (instantBytesPerSecond * 0.3);
+						lastSpeedBytes = uploaded;
+						lastSpeedUpdate = Stopwatch.GetTimestamp();
+					}
+
+					var speedMegabytes = smoothedBytesPerSecond / 1048576d;
+					var speedMegabits = smoothedBytesPerSecond * 8 / 1000000d;
+					ctx.Status($"Uploading delta.zip... {percent}% ({uploaded / 1048576d:F2} MB / {totalBytes / 1048576d:F2} MB) {speedMegabytes:F2} MB/s ({speedMegabits:F2} Mbps)");
+				}));
+				content.Headers.ContentLength = length;
+
+				using var request = new HttpRequestMessage(HttpMethod.Put, $"api/upload/sessions/{session.UploadId}/chunks/{chunkIndex}")
+				{
+					Content = content
+				};
+				using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+				await response.EnsureSuccessWithDetailsAsync();
+				sent = true;
+				completedBytes += length;
+				completedChunks.Add(chunkIndex);
+				ctx.Status($"Chunk {chunkIndex + 1}/{totalChunks} completed ({completedChunks.Count}/{totalChunks}).");
+			}
+			catch (Exception ex) when (attempt < 5)
+			{
+				ctx.Status($"Chunk {chunkIndex + 1} failed; retrying ({attempt}/4)...");
+				await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, attempt))), CancellationToken.None);
+				if (ex is OperationCanceledException)
+					throw;
+			}
+		}
+
+		if (!sent)
+			throw new IOException($"Chunk {chunkIndex + 1} could not be uploaded after 5 attempts.");
+	}
+
+	ctx.Status("[yellow]Upload complete. Verifying and deploying on server...[/]");
+	using var completeResponse = await client.PostAsync($"api/upload/sessions/{session.UploadId}/complete", content: null);
+	await completeResponse.EnsureSuccessWithDetailsAsync();
+	await DeletePendingUploadManifestAsync(manifestPath);
+	if (!string.Equals(uploadZipPath, zipPath, StringComparison.OrdinalIgnoreCase) && File.Exists(uploadZipPath))
+		File.Delete(uploadZipPath);
+}
+
+static string GetPendingUploadManifestPath(ProjectConfig project, string version, string fileHash)
+{
+	var key = $"{project.Name}|{version}|{project.EnableRollback}|{fileHash}";
+	var keyHash = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
+	var directory = Path.Combine(Path.GetTempPath(), "FastCICD-ClientUploadSessions");
+	Directory.CreateDirectory(directory);
+	return Path.Combine(directory, keyHash + ".json");
+}
+
+static async Task<PendingUploadManifest?> LoadPendingUploadManifestAsync(string path)
+{
+	if (!File.Exists(path))
+		return null;
+
+	try
+	{
+		await using var stream = File.OpenRead(path);
+		return await System.Text.Json.JsonSerializer.DeserializeAsync<PendingUploadManifest>(stream);
+	}
+	catch (System.Text.Json.JsonException)
+	{
+		return null;
+	}
+}
+
+static async Task SavePendingUploadManifestAsync(string path, PendingUploadManifest manifest)
+{
+	var temporaryPath = path + ".tmp";
+	await File.WriteAllTextAsync(temporaryPath, System.Text.Json.JsonSerializer.Serialize(manifest));
+	File.Move(temporaryPath, path, overwrite: true);
+}
+
+static Task DeletePendingUploadManifestAsync(string path)
+{
+	if (File.Exists(path))
+		File.Delete(path);
+	return Task.CompletedTask;
+}
+
+static async Task<string> ComputeFileHashAsync(string path)
+{
+	await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+	using var sha256 = SHA256.Create();
+	return Convert.ToHexStringLower(await sha256.ComputeHashAsync(stream));
 }
