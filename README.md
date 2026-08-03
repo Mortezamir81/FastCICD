@@ -135,6 +135,9 @@ Once configured, simply run the FastCICD Client console application. You will be
 ## 🔒 Security Notes
 * **Never share your `SecurityKey`.** It acts as the master password between your client and server.
 * The HMAC signature generates a unique cryptographic hash for every request based on the current time. This completely prevents **Replay Attacks**. If a request is intercepted, it will naturally expire in 5 minutes and cannot be reused.
+* Upload requests use the server's `UploadHmacValidityMinutes` setting (120 minutes in the example configuration) because reverse proxies may buffer large multipart requests before forwarding them. Keep client and server clocks synchronized.
+* Deployments use resumable 8 MB chunks. A failed chunk is retried independently, and the server keeps the upload session and partial file until completion or cleanup.
+* The client stores a local resume manifest keyed by project, version, backup mode, and ZIP SHA-256. Re-running with the same artifact resumes the previous session; changed files or a changed version intentionally create a new deployment session.
 
 ---
 
