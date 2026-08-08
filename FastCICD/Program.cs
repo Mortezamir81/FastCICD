@@ -4,6 +4,7 @@ using System.IO.Compression;
 using System.Net.Http.Json;
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Text.Json;
 using FastCICD;
 using Microsoft.Extensions.Configuration;
 using Spectre.Console;
@@ -28,13 +29,33 @@ if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(apiKey) || 
 	return;
 }
 
-var handler = new HmacDelegatingHandler(apiKey, new HttpClientHandler());
+var handler = new HmacDelegatingHandler(() => config["DeployerSettings:SecurityKey"] ?? "", new HttpClientHandler());
 using var httpClient = new HttpClient(handler) { BaseAddress = new Uri(endpoint) };
 httpClient.DefaultRequestHeaders.Add("X-Api-Key", apiKey);
 httpClient.Timeout = TimeSpan.FromMinutes(60);
 
 while (true)
 {
+	// Pick up appsettings changes without restarting the client.
+	settings = config.GetSection("DeployerSettings");
+	endpoint = settings["ServerEndpoint"] ?? endpoint;
+	projects = settings.GetSection("Projects").Get<List<ProjectConfig>>() ?? [];
+	if (Uri.TryCreate(endpoint, UriKind.Absolute, out var refreshedEndpoint))
+		httpClient.BaseAddress = refreshedEndpoint;
+	var refreshedApiKey = settings["SecurityKey"];
+	if (!string.IsNullOrWhiteSpace(refreshedApiKey))
+	{
+		httpClient.DefaultRequestHeaders.Remove("X-Api-Key");
+		httpClient.DefaultRequestHeaders.Add("X-Api-Key", refreshedApiKey);
+	}
+
+	if (projects.Count == 0)
+	{
+		AnsiConsole.MarkupLine("[bold white on red] ❌ No deployer projects are configured. [/] ");
+		await Task.Delay(1500);
+		continue;
+	}
+
 	// UI Setup: Welcome and Project Selection
 	AnsiConsole.Clear();
 	AnsiConsole.Write(new FigletText("Auto Deployer").Centered().Color(Color.Cyan1));
@@ -336,11 +357,25 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 	}
 
 	// 3. Start the deployment pipeline
-	await AnsiConsole.Status()
-		.Spinner(Spinner.Known.BouncingBar)
-		.SpinnerStyle(Style.Parse("green"))
-		.StartAsync("Initializing...", async ctx =>
+	await AnsiConsole.Live(new Markup("[grey]Initializing...[/]"))
+		.AutoClear(false)
+		.StartAsync(async live =>
 		{
+			var displayLines = new List<string>();
+			Action renderDisplay = () =>
+				live.UpdateTarget(new Rows(displayLines.Select(line => new Markup(line))));
+			Action<string> status = text =>
+			{
+				displayLines.Add(text);
+				while (displayLines.Count > 18)
+					displayLines.RemoveAt(0);
+				renderDisplay();
+			};
+			Action clearCommandOutput = () =>
+			{
+				displayLines.Clear();
+				renderDisplay();
+			};
 			bool servicesWereStopped = false;
 			bool wasDeltaUploadedSuccessfully = false;
 
@@ -348,9 +383,9 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 			{
 				if (project.LocalPreDeployCommands.Count != 0)
 				{
-					ctx.Status("[magenta]Executing LOCAL Pre-Deploy commands...[/]");
-					await ExecuteLocalCommandsAsync(project.LocalPreDeployCommands, "Local Pre-Deploy", ctx);
-					AnsiConsole.MarkupLine("[grey]✓ Local Pre-Deploy commands executed successfully.[/]");
+					status("[magenta]Executing LOCAL Pre-Deploy commands...[/]");
+					await ExecuteLocalCommandsAsync(project.LocalPreDeployCommands, "Local Pre-Deploy", status, clearCommandOutput);
+					status("[grey]✓ Local Pre-Deploy commands executed successfully.[/]");
 				}
 
 				if (!Directory.Exists(project.LocalSourcePath))
@@ -360,43 +395,45 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 
 				if (project.PreDeployCommands.Count != 0)
 				{
-					ctx.Status("[magenta]Executing Pre-Deploy CLI Commands on server...[/]");
-					await ExecuteRemoteCommandsAsync(httpClient, project.Name, project.PreDeployCommands);
-					AnsiConsole.MarkupLine("[grey]✓ Pre-Deploy commands executed successfully.[/]");
+					status("[magenta]Executing Pre-Deploy CLI Commands on server...[/]");
+					await ExecuteRemoteCommandsAsync(httpClient, project.Name, project.PreDeployCommands, status);
+					status("[grey]✓ Pre-Deploy commands executed successfully.[/]");
 				}
 
-				ctx.Status("[blue]Calculating local file hashes (Multi-core)...[/]");
+				status("[blue]Calculating local file hashes (Multi-core)...[/]");
 				var localFiles = GetLocalFileHashes(project.LocalSourcePath, project.IgnoredFiles);
-				AnsiConsole.MarkupLine($"[grey]Found {localFiles.Count} files locally.[/]");
+				status($"[grey]Found {localFiles.Count} files locally.[/]");
 
 				if (project.ServicesToManage.Count != 0)
 				{
-					ctx.Status("[red]Stopping Windows Services on remote server...[/]");
+					status("[red]Stopping Windows Services on remote server...[/]");
 					var stopRes = await httpClient.PostAsJsonAsync("api/services",
 						new { Services = project.ServicesToManage, Action = "stop" });
 					await stopRes.EnsureSuccessWithDetailsAsync();
 
 					servicesWereStopped = true;
-					AnsiConsole.MarkupLine("[grey]Services stopped successfully.[/]");
+					status("[grey]Services stopped successfully.[/]");
 				}
 
-				ctx.Status("[blue]Comparing with server state...[/]");
+				status("[blue]Comparing with server state...[/]");
 
 				var response = await httpClient.PostAsJsonAsync("api/compare",
-					new { ProjectName = project.Name, FileHashes = localFiles });
+					new { ProjectName = project.Name, FileHashes = localFiles, IgnoredFiles = project.IgnoredFiles, MirrorServerToLocal = project.MirrorServerToLocal });
 				await response.EnsureSuccessWithDetailsAsync();
 
-				var deltaFiles = await response.Content.ReadFromJsonAsync<List<string>>();
+				var compareResult = await response.Content.ReadFromJsonAsync<CompareResponse>();
+				var deltaFiles = compareResult?.DeltaFiles ?? [];
+				var extraFileCount = compareResult?.ExtraFileCount ?? 0;
 
-				if (deltaFiles == null || deltaFiles.Count == 0)
+				if (deltaFiles.Count == 0 && extraFileCount == 0)
 				{
-					AnsiConsole.MarkupLine("[bold green]✓ Everything is up to date! No deployment needed.[/]");
+					status("[bold green]✓ Everything is up to date! No deployment needed.[/]");
 					return;
 				}
-				AnsiConsole.MarkupLine($"[grey]Delta identified: {deltaFiles.Count} files need to be updated.[/]");
+				status($"[grey]Delta identified: {deltaFiles.Count} local files need uploading and {extraFileCount} extra server files will be deleted.[/]");
 
 				// This acts as an eraser and completely overwrites the old "Comparing..." text.
-				ctx.Status("[yellow]Zipping and uploading delta files...[/]");
+				status("[yellow]Zipping and uploading delta files...[/]");
 
 				// Print an empty line to push the cursor down
 				AnsiConsole.WriteLine();
@@ -426,24 +463,19 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 					table.AddRow("[grey]...[/]", $"[grey]... and {deltaFiles.Count - maxDisplay} more files hidden for performance.[/]");
 				}
 
-				AnsiConsole.Clear();
-
-				// Draw the table cleanly above the new spinner text
-				AnsiConsole.Write(table);
+				status($"[grey]Preparing {deltaFiles.Count} changed files for upload...[/]");
 
 				// Pass the version variable here
-				await UploadDeltaZipAsync(httpClient, project, deltaFiles, version, ctx);
-				AnsiConsole.MarkupLine("[grey]Files uploaded and extracted successfully.[/]");
+				await UploadDeltaZipAsync(httpClient, project, deltaFiles, compareResult?.SyncManifestId, version, status);
+				status("[grey]Files uploaded and extracted successfully.[/]");
 
 				wasDeltaUploadedSuccessfully = true;
 
-				AnsiConsole.WriteLine();
-				AnsiConsole.MarkupLine("[bold green]🚀 Deployment Completed Successfully![/]");
+				status("[bold green]🚀 Deployment Completed Successfully![/]");
 			}
 			catch (Exception ex)
 			{
-				AnsiConsole.WriteLine();
-				AnsiConsole.MarkupLine($"[bold red]❌ Deployment Failed:[/] {Markup.Escape(ex.Message)}");
+				status($"[bold red]❌ Deployment Failed:[/] {Markup.Escape(ex.Message)}");
 			}
 			finally
 			{
@@ -453,15 +485,15 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 
 				if (shouldRunLocalPostDeploy)
 				{
-					ctx.Status("[magenta]Executing LOCAL Post-Deploy commands...[/]");
+					status("[magenta]Executing LOCAL Post-Deploy commands...[/]");
 					try
 					{
-						await ExecuteLocalCommandsAsync(project.LocalPostDeployCommands, "Local Post-Deploy", ctx);
-						AnsiConsole.MarkupLine("[grey]✓ Local Post-Deploy commands executed successfully.[/]");
+						await ExecuteLocalCommandsAsync(project.LocalPostDeployCommands, "Local Post-Deploy", status, clearCommandOutput);
+						status("[grey]✓ Local Post-Deploy commands executed successfully.[/]");
 					}
 					catch (Exception localEx)
 					{
-						AnsiConsole.MarkupLine($"[bold red]❌ Local Post-Deploy commands failed:[/] {Markup.Escape(localEx.Message)}");
+						status($"[bold red]❌ Local Post-Deploy commands failed:[/] {Markup.Escape(localEx.Message)}");
 					}
 				}
 
@@ -471,33 +503,33 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 
 				if (shouldRunPostDeploy)
 				{
-					ctx.Status("[magenta]Executing Post-Deploy CLI Commands on server...[/]");
+					status("[magenta]Executing Post-Deploy CLI Commands on server...[/]");
 					try
 					{
-						await ExecuteRemoteCommandsAsync(httpClient, project.Name, project.PostDeployCommands);
-						AnsiConsole.MarkupLine("[grey]✓ Post-Deploy commands executed successfully.[/]");
+						await ExecuteRemoteCommandsAsync(httpClient, project.Name, project.PostDeployCommands, status);
+						status("[grey]✓ Post-Deploy commands executed successfully.[/]");
 					}
 					catch (Exception postEx)
 					{
 						// Wrap in a try-catch so it doesn't crash and block the service restart (Safety Net)
-						AnsiConsole.MarkupLine($"[bold red]❌ Post-Deploy commands failed:[/] {Markup.Escape(postEx.Message)}");
+						status($"[bold red]❌ Post-Deploy commands failed:[/] {Markup.Escape(postEx.Message)}");
 					}
 				}
 
 				// 2. Execute Safety Net: Restarting Windows Services
 				if (servicesWereStopped)
 				{
-					ctx.Status("[green]Executing Safety Net: Restarting Windows Services...[/]");
+					status("[green]Executing Safety Net: Restarting Windows Services...[/]");
 					try
 					{
 						var startRes = await httpClient.PostAsJsonAsync("api/services",
 							new { Services = project.ServicesToManage, Action = "start" });
 						await startRes.EnsureSuccessWithDetailsAsync();
-						AnsiConsole.MarkupLine("[grey]Services safely restarted.[/]");
+						status("[grey]Services safely restarted.[/]");
 					}
 					catch (Exception finalEx)
 					{
-						AnsiConsole.MarkupLine($"[bold white on red] CRITICAL ERROR: Could not restart services. Manual intervention required! [/] {Markup.Escape(finalEx.Message)}");
+						status($"[bold white on red] CRITICAL ERROR: Could not restart services. Manual intervention required! [/] {Markup.Escape(finalEx.Message)}");
 					}
 				}
 			}
@@ -537,7 +569,7 @@ static Dictionary<string, string> GetLocalFileHashes(string basePath, List<strin
 	return hashes.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
 }
 
-static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, List<string> deltaFiles, string version, StatusContext ctx)
+static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, List<string> deltaFiles, string? syncManifestId, string version, Action<string> status)
 {
 	var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
 	var zipPath = tempDir + ".zip";
@@ -546,7 +578,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 	try
 	{
 		// 1. Update UI to show we are currently Zipping
-		ctx.Status("[yellow]Zipping delta files locally...[/]");
+		status("[yellow]Zipping delta files locally...[/]");
 		Directory.CreateDirectory(tempDir);
 
 		foreach (var file in deltaFiles)
@@ -560,11 +592,11 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 		ZipFile.CreateFromDirectory(tempDir, zipPath);
 
 		// 2. Update UI to show we are switching to Upload mode
-		ctx.Status("[blue]Starting upload process...[/]");
+		status("[blue]Starting upload process...[/]");
 
 		try
 		{
-			await UploadResumableAsync(client, project, version, zipPath, ctx);
+			await UploadResumableAsync(client, project, syncManifestId, version, zipPath, status);
 		}
 		catch
 		{
@@ -603,14 +635,44 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 	}
 }
 
-static async Task ExecuteRemoteCommandsAsync(HttpClient client, string projectName, List<string> commands)
+static async Task ExecuteRemoteCommandsAsync(HttpClient client, string projectName, List<string> commands, Action<string>? status = null)
 {
-	var res = await client.PostAsJsonAsync("api/execute", new { ProjectName = projectName, Commands = commands });
-
-	if (!res.IsSuccessStatusCode)
+	using var request = new HttpRequestMessage(HttpMethod.Post, "api/execute")
 	{
-		var errorContent = await res.Content.ReadAsStringAsync();
-		throw new Exception($"CLI Command execution failed: {errorContent}");
+		Content = JsonContent.Create(new { ProjectName = projectName, Commands = commands })
+	};
+	using var res = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+
+	await res.EnsureSuccessWithDetailsAsync();
+	using var stream = await res.Content.ReadAsStreamAsync();
+	using var reader = new StreamReader(stream);
+	while (await reader.ReadLineAsync() is { } line)
+	{
+		if (string.IsNullOrWhiteSpace(line))
+			continue;
+
+		using var eventJson = JsonDocument.Parse(line);
+		var root = eventJson.RootElement;
+		var type = root.TryGetProperty("type", out var typeValue) ? typeValue.GetString() : "";
+		var message = root.TryGetProperty("message", out var messageValue) ? messageValue.GetString() : null;
+		var command = root.TryGetProperty("command", out var commandValue) ? commandValue.GetString() : null;
+		var display = type switch
+		{
+			"started" => $"Starting remote script: {command}",
+			"output" => $"OUT: {message}",
+			"error" => $"ERR: {message}",
+			"completed" => $"Completed remote script: {command}",
+			_ => message
+		};
+		if (!string.IsNullOrWhiteSpace(display))
+		{
+			if (status != null)
+				status($"[magenta]{Markup.Escape(display!)}[/]");
+			else
+				AnsiConsole.MarkupLine($"[grey]{Markup.Escape(display!)}[/]");
+		}
+		if (type == "error")
+			throw new Exception($"CLI command execution failed: {message}");
 	}
 }
 
@@ -623,7 +685,7 @@ static async Task ManualExecuteCommandsAsync(HttpClient client, string projectNa
 		{
 			try
 			{
-				await ExecuteRemoteCommandsAsync(client, projectName, commands);
+				await ExecuteRemoteCommandsAsync(client, projectName, commands, message => ctx.Status(message));
 				AnsiConsole.MarkupLine($"[bold green]✓ {label} commands executed successfully on the server.[/]");
 			}
 			catch (Exception ex)
@@ -633,70 +695,87 @@ static async Task ManualExecuteCommandsAsync(HttpClient client, string projectNa
 		});
 }
 
-static async Task ExecuteLocalCommandsAsync(List<LocalCommandConfig> commands, string label, StatusContext? ctx = null)
+static async Task ExecuteLocalCommandsAsync(List<LocalCommandConfig> commands, string label, Action<string>? status = null, Action? clearAfterCommand = null)
 {
 	int index = 0;
 	foreach (var cmd in commands)
 	{
 		index++;
-		var statusText = $"[magenta]{label} ({index}/{commands.Count}):[/] [white]{Markup.Escape(cmd.Command)}[/]";
-		ctx?.Status(statusText);
-		AnsiConsole.MarkupLine($"[grey]→ Running:[/] [white]{Markup.Escape(cmd.Command)}[/]");
+		var statusText = $"> {Markup.Escape(cmd.Command)}";
+		status?.Invoke(statusText);
+		if (status == null)
+			AnsiConsole.MarkupLine($"[grey]→ Running:[/] [white]{Markup.Escape(cmd.Command)}[/]");
 
-		var psi = new System.Diagnostics.ProcessStartInfo
-		{
-			FileName = "cmd.exe",
-			Arguments = $"/c {cmd.Command}",
-			WorkingDirectory = string.IsNullOrWhiteSpace(cmd.WorkingDirectory)
-				? Directory.GetCurrentDirectory()
-				: cmd.WorkingDirectory,
-			RedirectStandardOutput = true,
-			RedirectStandardError = true,
-			UseShellExecute = false,
-			CreateNoWindow = true
-		};
+			var psi = new System.Diagnostics.ProcessStartInfo
+			{
+				FileName = "cmd.exe",
+				Arguments = $"/c {cmd.Command}",
+				WorkingDirectory = string.IsNullOrWhiteSpace(cmd.WorkingDirectory)
+					? Directory.GetCurrentDirectory()
+					: cmd.WorkingDirectory,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				UseShellExecute = false,
+				CreateNoWindow = true
+			};
 
-		using var process = System.Diagnostics.Process.Start(psi)
-			?? throw new Exception($"Could not start local command: '{cmd.Command}'");
+			using var process = System.Diagnostics.Process.Start(psi)
+				?? throw new Exception($"Could not start local command: '{cmd.Command}'");
 
-		var stdOutTask = process.StandardOutput.ReadToEndAsync();
-		var stdErrTask = process.StandardError.ReadToEndAsync();
-		await process.WaitForExitAsync();
+			var output = new List<string>();
+			var errorOutput = new List<string>();
+		var stdOutTask = ReadProcessOutputAsync(process.StandardOutput, line =>
+			{
+				output.Add(line);
+				ShowLocalProcessLog(status, label, index, line);
+			});
+		var stdErrTask = ReadProcessOutputAsync(process.StandardError, line =>
+			{
+				errorOutput.Add(line);
+				ShowLocalProcessLog(status, label, index, line, isError: true);
+			});
+			await Task.WhenAll(stdOutTask, stdErrTask, process.WaitForExitAsync());
 
-		var stdOut = await stdOutTask;
-		var stdErr = await stdErrTask;
+			if (process.ExitCode != 0)
+			{
+				var details = errorOutput.Count == 0 ? output : errorOutput;
+				var lastLines = string.Join("\n", details.TakeLast(15));
+				throw new Exception($"Local command #{index} failed (ExitCode {process.ExitCode}): '{cmd.Command}'\n--- Output ---\n{lastLines}");
+			}
 
-		if (process.ExitCode != 0)
-		{
-			var details = string.IsNullOrWhiteSpace(stdErr) ? stdOut : stdErr;
-			var lastLines = string.Join("\n", details.Split('\n').TakeLast(15));
-			throw new Exception($"Local command #{index} failed (ExitCode {process.ExitCode}): '{cmd.Command}'\n--- Output ---\n{lastLines}");
+			if (status == null)
+				AnsiConsole.MarkupLine($"[grey]  ✓ ({index}/{commands.Count}) Done.[/]");
+			clearAfterCommand?.Invoke();
 		}
+}
 
-		AnsiConsole.MarkupLine($"[grey]  ✓ ({index}/{commands.Count}) Done.[/]");
-	}
+static void ShowLocalProcessLog(Action<string>? status, string label, int index, string line, bool isError = false)
+{
+	if (string.IsNullOrWhiteSpace(line))
+		return;
+
+	var text = line.Length > 400 ? line[..400] + "..." : line;
+	var markup = Markup.Escape(text);
+	if (status != null)
+		status(markup);
+	else
+		AnsiConsole.MarkupLine(markup);
 }
 
 static async Task ManualExecuteLocalCommandsAsync(List<LocalCommandConfig> commands, string label)
 {
-	await AnsiConsole.Status()
-		.Spinner(Spinner.Known.Dots)
-		.SpinnerStyle(Style.Parse("magenta"))
-		.StartAsync($"[yellow]Executing {label} commands locally...[/]", async ctx =>
+	try
 		{
-			try
-			{
-				await ExecuteLocalCommandsAsync(commands, label, ctx);
-				AnsiConsole.MarkupLine($"[bold green]✓ {label} commands executed successfully.[/]");
-			}
-			catch (Exception ex)
-			{
-				AnsiConsole.MarkupLine($"[bold red]❌ {label} commands failed:[/] {Markup.Escape(ex.Message)}");
-			}
-		});
+		await ExecuteLocalCommandsAsync(commands, label);
+		AnsiConsole.MarkupLine($"[bold green]✓ {label} commands executed successfully.[/]");
+	}
+	catch (Exception ex)
+	{
+		AnsiConsole.MarkupLine($"[bold red]❌ {label} commands failed:[/] {Markup.Escape(ex.Message)}");
+	}
 }
 
-static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string version, string zipPath, StatusContext ctx)
+static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string? syncManifestId, string version, string zipPath, Action<string> uploadStatus)
 {
 	const int chunkSize = 8 * 1024 * 1024;
 	var totalBytes = new FileInfo(zipPath).Length;
@@ -708,7 +787,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 
 	if (manifest != null && File.Exists(manifest.ZipPath))
 	{
-		ctx.Status("[yellow]Resuming previous upload session...[/]");
+	uploadStatus("[yellow]Resuming previous upload session...[/]");
 		using var existingStatusResponse = await client.GetAsync($"api/upload/sessions/{manifest.UploadId}");
 		if (existingStatusResponse.IsSuccessStatusCode)
 		{
@@ -729,7 +808,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 			File.Delete(manifestPath);
 
 		using var sessionResponse = await client.PostAsJsonAsync("api/upload/sessions", new CreateUploadSessionRequest(
-			project.Name, version, project.EnableRollback, totalBytes, chunkSize, fileHash));
+			project.Name, version, project.EnableRollback, project.MirrorServerToLocal, [], [], syncManifestId, totalBytes, chunkSize, fileHash));
 		await sessionResponse.EnsureSuccessWithDetailsAsync();
 		session = await sessionResponse.Content.ReadFromJsonAsync<UploadSessionResponse>()
 			?? throw new InvalidOperationException("The server did not return an upload session.");
@@ -739,6 +818,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 			ProjectName = project.Name,
 			Version = version,
 			EnableBackup = project.EnableRollback,
+			MirrorServerToLocal = project.MirrorServerToLocal,
 			FileHash = fileHash,
 			ZipPath = zipPath
 		};
@@ -772,7 +852,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 		{
 			try
 			{
-				ctx.Status($"Uploading chunk {chunkIndex + 1}/{totalChunks} ({completedChunks.Count}/{totalChunks} completed)...");
+				uploadStatus($"Uploading chunk {chunkIndex + 1}/{totalChunks} ({completedChunks.Count}/{totalChunks} completed)...");
 				using var fileStream = new FileStream(uploadZipPath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
 				fileStream.Position = offset;
 				var lastProgressUpdate = Stopwatch.GetTimestamp();
@@ -796,7 +876,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 
 					var speedMegabytes = smoothedBytesPerSecond / 1048576d;
 					var speedMegabits = smoothedBytesPerSecond * 8 / 1000000d;
-					ctx.Status($"Uploading delta.zip... {percent}% ({uploaded / 1048576d:F2} MB / {totalBytes / 1048576d:F2} MB) {speedMegabytes:F2} MB/s ({speedMegabits:F2} Mbps)");
+					uploadStatus($"Uploading delta.zip... {percent}% ({uploaded / 1048576d:F2} MB / {totalBytes / 1048576d:F2} MB) {speedMegabytes:F2} MB/s ({speedMegabits:F2} Mbps)");
 				}));
 				content.Headers.ContentLength = length;
 
@@ -809,11 +889,11 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 				sent = true;
 				completedBytes += length;
 				completedChunks.Add(chunkIndex);
-				ctx.Status($"Chunk {chunkIndex + 1}/{totalChunks} completed ({completedChunks.Count}/{totalChunks}).");
+				uploadStatus($"Chunk {chunkIndex + 1}/{totalChunks} completed ({completedChunks.Count}/{totalChunks}).");
 			}
 			catch (Exception ex) when (attempt < 5)
 			{
-				ctx.Status($"Chunk {chunkIndex + 1} failed; retrying ({attempt}/4)...");
+				uploadStatus($"Chunk {chunkIndex + 1} failed; retrying ({attempt}/4)...");
 				await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, attempt))), CancellationToken.None);
 				if (ex is OperationCanceledException)
 					throw;
@@ -824,7 +904,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 			throw new IOException($"Chunk {chunkIndex + 1} could not be uploaded after 5 attempts.");
 	}
 
-	ctx.Status("[yellow]Upload complete. Verifying and deploying on server...[/]");
+	uploadStatus("[yellow]Upload complete. Verifying and deploying on server...[/]");
 	using var completeResponse = await client.PostAsync($"api/upload/sessions/{session.UploadId}/complete", content: null);
 	await completeResponse.EnsureSuccessWithDetailsAsync();
 	await DeletePendingUploadManifestAsync(manifestPath);
@@ -856,6 +936,13 @@ static async Task<PendingUploadManifest?> LoadPendingUploadManifestAsync(string 
 		return null;
 	}
 }
+
+static async Task ReadProcessOutputAsync(StreamReader reader, Action<string> onLine)
+{
+	while (await reader.ReadLineAsync() is { } line)
+		onLine(line);
+}
+
 
 static async Task SavePendingUploadManifestAsync(string path, PendingUploadManifest manifest)
 {
