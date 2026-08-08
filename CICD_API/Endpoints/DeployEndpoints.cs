@@ -11,6 +11,17 @@ namespace CICD_API.Endpoints;
 
 public static class DeployEndpoints
 {
+	private static bool IsIgnoredPath(string path, IEnumerable<string> ignoredFiles)
+	{
+		var normalizedPath = path.Replace('/', '\\');
+		return ignoredFiles.Any(ignored =>
+		{
+			var normalizedIgnored = ignored.Replace('/', '\\').TrimEnd('\\');
+			return normalizedPath.Equals(normalizedIgnored, StringComparison.OrdinalIgnoreCase) ||
+				normalizedPath.StartsWith(normalizedIgnored + "\\", StringComparison.OrdinalIgnoreCase);
+		});
+	}
+
 	private static string GetMetadataPath(string backupDirBase, string projectName)
 		=> Path.Combine(backupDirBase, projectName, "project_metadata.json");
 
@@ -32,6 +43,7 @@ public static class DeployEndpoints
 			}
 
 			var missingOrChanged = new ConcurrentBag<string>();
+			var ignoredFiles = request.IgnoredFiles ?? [];
 
 			Parallel.ForEach(request.FileHashes, file =>
 			{
@@ -57,8 +69,22 @@ public static class DeployEndpoints
 					missingOrChanged.Add(file.Key);
 			});
 
-			logger.LogInformation("Comparison completed for project '{ProjectName}'. Found {Count} missing or changed files.", request.ProjectName, missingOrChanged.Count);
-			return Results.Ok(missingOrChanged.ToList());
+			var extraFiles = new List<string>();
+			if (request.MirrorServerToLocal && Directory.Exists(baseDir))
+			{
+				foreach (var remoteFile in Directory.EnumerateFiles(baseDir, "*", SearchOption.AllDirectories))
+				{
+					var relativePath = Path.GetRelativePath(baseDir, remoteFile);
+					if (!IsIgnoredPath(relativePath, ignoredFiles) && !request.FileHashes.ContainsKey(relativePath))
+						extraFiles.Add(relativePath);
+				}
+			}
+			var syncManifestId = request.MirrorServerToLocal && (missingOrChanged.Count > 0 || extraFiles.Count > 0)
+				? SyncManifestStore.Create(request.ProjectName, ignoredFiles, request.FileHashes.Keys)
+				: null;
+
+			logger.LogInformation("Comparison completed for project '{ProjectName}'. Found {ChangedCount} missing or changed files and {ExtraCount} extra files.", request.ProjectName, missingOrChanged.Count, extraFiles.Count);
+			return Results.Ok(new CompareResponse(missingOrChanged.ToList(), extraFiles.Count, syncManifestId));
 		});
 
 		// Manage Windows Services (Start, Stop, Status)
@@ -346,7 +372,7 @@ public static class DeployEndpoints
 		});
 
 		// Execute Remote CLI Commands
-		app.MapPost("/api/execute", async ([FromBody] CommandRequest request, IConfiguration config, ILogger<Program> logger) =>
+		app.MapPost("/api/execute", async ([FromBody] CommandRequest request, HttpResponse response, IConfiguration config, ILogger<Program> logger, CancellationToken cancellationToken) =>
 		{
 			logger.LogInformation("Executing {Count} remote CLI commands for project '{ProjectName}'.", request.Commands.Count, request.ProjectName);
 
@@ -357,7 +383,19 @@ public static class DeployEndpoints
 				return Results.BadRequest("Project not defined.");
 			}
 
-			var results = new List<object>();
+			response.ContentType = "application/x-ndjson";
+			var writeLock = new SemaphoreSlim(1, 1);
+			async Task WriteEventAsync(object value)
+			{
+				await writeLock.WaitAsync(cancellationToken);
+				try
+				{
+					await JsonSerializer.SerializeAsync(response.Body, value, cancellationToken: cancellationToken);
+					await response.Body.WriteAsync("\n"u8.ToArray(), cancellationToken);
+					await response.Body.FlushAsync(cancellationToken);
+				}
+				finally { writeLock.Release(); }
+			}
 
 			foreach (var cmd in request.Commands)
 			{
@@ -375,6 +413,7 @@ public static class DeployEndpoints
 					}
 
 					logger.LogInformation("Executing command: '{Command}' in directory '{BaseDirectory}'", loggableCmd, safeWorkingDirectory);
+					await WriteEventAsync(new { Type = "started", Command = loggableCmd });
 					bool isWindows = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows);
 
 					var processInfo = new System.Diagnostics.ProcessStartInfo
@@ -392,43 +431,56 @@ public static class DeployEndpoints
 					using var process = System.Diagnostics.Process.Start(processInfo);
 					if (process != null)
 					{
-						using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+						using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+						using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+						var outputTask = StreamProcessOutputAsync(process.StandardOutput, "output", WriteEventAsync, linkedCts.Token);
+						var errorTask = StreamProcessOutputAsync(process.StandardError, "error", WriteEventAsync, linkedCts.Token);
 
 						try
 						{
-							await process.WaitForExitAsync(cts.Token);
+							await process.WaitForExitAsync(linkedCts.Token);
+							await Task.WhenAll(outputTask, errorTask);
 						}
 						catch (TaskCanceledException)
 						{
 							logger.LogError("Command '{Command}' timed out after 2 minutes. Killing process.", loggableCmd);
-							process.Kill();
-							return Results.Problem($"Command '{loggableCmd}' timed out after 2 minutes.");
+							if (!process.HasExited) process.Kill(entireProcessTree: true);
+							await WriteEventAsync(new { Type = "error", Message = $"Command '{loggableCmd}' timed out after 2 minutes." });
+							return Results.Empty;
 						}
-
-						var output = await process.StandardOutput.ReadToEndAsync();
-						var error = await process.StandardError.ReadToEndAsync();
 
 						if (process.ExitCode != 0)
 						{
-							logger.LogError("Command '{Command}' failed with exit code {ExitCode}. Error output: {Error}", loggableCmd, process.ExitCode, error);
-							return Results.Problem($"Command '{loggableCmd}' failed with exit code {process.ExitCode}.\nError: {error}");
+							logger.LogError("Command '{Command}' failed with exit code {ExitCode}.", loggableCmd, process.ExitCode);
+							await WriteEventAsync(new { Type = "error", Message = $"Command '{loggableCmd}' failed with exit code {process.ExitCode}." });
+							return Results.Empty;
 						}
 
 						logger.LogInformation("Command '{Command}' executed successfully.", loggableCmd);
-
-						// Mask output in results if needed, though usually standard output of BitLocker doesn't echo the password
-						results.Add(new { Command = loggableCmd, Output = output });
+						await WriteEventAsync(new { Type = "completed", Command = loggableCmd });
 					}
 				}
 				catch (Exception ex)
 				{
 					logger.LogError(ex, "Exception occurred while executing command: {Message}", ex.Message);
-					return Results.Problem($"Failed to execute command: {ex.Message}");
+					await WriteEventAsync(new { Type = "error", Message = $"Failed to execute command: {ex.Message}" });
+					return Results.Empty;
 				}
 			}
 
-			return Results.Ok(results);
+			await WriteEventAsync(new { Type = "finished" });
+			return Results.Empty;
 		});
+	}
+
+	private static async Task StreamProcessOutputAsync(
+		StreamReader reader,
+		string streamName,
+		Func<object, Task> writeEventAsync,
+		CancellationToken cancellationToken)
+	{
+		while (await reader.ReadLineAsync(cancellationToken) is { } line)
+			await writeEventAsync(new { Type = streamName, Message = line });
 	}
 
 	private static void MapResumableUploadEndpoints(IEndpointRouteBuilder app)
@@ -449,6 +501,21 @@ public static class DeployEndpoints
 				return Results.BadRequest("A SHA-256 file hash is required.");
 
 			var normalizedRequest = request with { ChunkSize = Math.Min(request.ChunkSize, maxChunkSize) };
+			if (request.MirrorServerToLocal)
+			{
+				if (string.IsNullOrWhiteSpace(request.SyncManifestId))
+					return Results.Conflict("A synchronization manifest is required for mirror deployment. Please compare again.");
+
+				var manifest = SyncManifestStore.Take(request.SyncManifestId, request.ProjectName);
+				if (manifest == null)
+					return Results.Conflict("The synchronization manifest expired or is no longer available. Please compare again.");
+
+				normalizedRequest = normalizedRequest with
+				{
+					IgnoredFiles = manifest.IgnoredFiles,
+					SynchronizedFiles = manifest.SynchronizedFiles
+				};
+			}
 			var session = UploadSessionStore.Create(normalizedRequest);
 			logger.LogInformation("Created resumable upload session {UploadId} for project '{ProjectName}'.", session.Metadata.UploadId, request.ProjectName);
 			return Results.Ok(new
@@ -549,7 +616,7 @@ public static class DeployEndpoints
 						return Results.Problem("Upload integrity verification failed.", statusCode: StatusCodes.Status422UnprocessableEntity);
 				}
 
-				await ProcessUploadedZipAsync(session.PartFilePath, session.Metadata.ProjectName, session.Metadata.Version, session.Metadata.EnableBackup, config, logger);
+				await ProcessUploadedZipAsync(session.PartFilePath, session.Metadata.ProjectName, session.Metadata.Version, session.Metadata.EnableBackup, session.Metadata.MirrorServerToLocal, session.Metadata.IgnoredFiles, session.Metadata.SynchronizedFiles, config, logger);
 				UploadSessionStore.Delete(session);
 				return Results.Ok();
 			}
@@ -570,7 +637,7 @@ public static class DeployEndpoints
 		return Math.Min(metadata.ChunkSize, metadata.TotalBytes - offset);
 	}
 
-	private static async Task ProcessUploadedZipAsync(string zipPath, string projectName, string version, bool enableBackup, IConfiguration config, ILogger<Program> logger)
+	private static async Task ProcessUploadedZipAsync(string zipPath, string projectName, string version, bool enableBackup, bool mirrorServerToLocal, List<string> ignoredFiles, List<string> synchronizedFiles, IConfiguration config, ILogger<Program> logger)
 	{
 		var allowedDirs = config.GetSection("AllowedDirectories").Get<Dictionary<string, string>>();
 		var backupDirBase = config["BackupDirectory"];
@@ -606,6 +673,33 @@ public static class DeployEndpoints
 				if (File.Exists(destinationPath))
 					File.SetAttributes(destinationPath, File.GetAttributes(destinationPath) & ~FileAttributes.ReadOnly);
 				entry.ExtractToFile(destinationPath, overwrite: true);
+			}
+		}
+
+		if (mirrorServerToLocal)
+		{
+			var synchronizedPaths = synchronizedFiles
+				.Select(path => path.Replace('/', '\\'))
+				.ToHashSet(StringComparer.OrdinalIgnoreCase);
+			foreach (var existingFile in Directory.EnumerateFiles(baseDir, "*", SearchOption.AllDirectories).ToList())
+			{
+				var relativePath = Path.GetRelativePath(baseDir, existingFile);
+				if (!IsIgnoredPath(relativePath, ignoredFiles) && !synchronizedPaths.Contains(relativePath.Replace('/', '\\')))
+				{
+					File.SetAttributes(existingFile, File.GetAttributes(existingFile) & ~FileAttributes.ReadOnly);
+					File.Delete(existingFile);
+					logger.LogInformation("Mirror sync deleted extra server file '{FilePath}'.", relativePath);
+				}
+			}
+			foreach (var existingDirectory in Directory.EnumerateDirectories(baseDir, "*", SearchOption.AllDirectories)
+				.OrderByDescending(path => path.Length).ToList())
+			{
+				var relativePath = Path.GetRelativePath(baseDir, existingDirectory);
+				if (!IsIgnoredPath(relativePath, ignoredFiles) && !Directory.EnumerateFileSystemEntries(existingDirectory).Any())
+				{
+					Directory.Delete(existingDirectory);
+					logger.LogInformation("Mirror sync deleted extra server directory '{DirectoryPath}'.", relativePath);
+				}
 			}
 		}
 
