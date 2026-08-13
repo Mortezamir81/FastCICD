@@ -8,6 +8,7 @@ using System.Text.Json;
 using FastCICD;
 using Microsoft.Extensions.Configuration;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 
@@ -60,23 +61,12 @@ while (true)
 	AnsiConsole.Clear();
 	AnsiConsole.Write(new FigletText("Auto Deployer").Centered().Color(Color.Cyan1));
 
-	var projectChoices = projects.Select(p => p.Name).ToList();
-	projectChoices.Add("[red]Exit[/]");
-
-	var selectedProjectName = AnsiConsole.Prompt(
-		new SelectionPrompt<string>()
-			.Title("[green]Select the project you want to deploy:[/]")
-			.PageSize(10)
-			.AddChoices(projectChoices)
-	);
-
-	if (selectedProjectName == "[red]Exit[/]")
+	var project = SelectProject(projects);
+	if (project == null)
 	{
 		AnsiConsole.MarkupLine("[yellow]Exiting Auto Deployer. Goodbye![/]");
 		break;
 	}
-
-	var project = projects.First(p => p.Name == selectedProjectName);
 
 	await HandleProjectMenuAsync(httpClient, project);
 
@@ -84,6 +74,75 @@ while (true)
 }
 
 // --- Helper Methods ---
+static ProjectConfig? SelectProject(List<ProjectConfig> projects)
+{
+	var groups = projects
+		.Where(project => !string.IsNullOrWhiteSpace(project.Group))
+		.GroupBy(project => project.Group!.Trim(), StringComparer.OrdinalIgnoreCase)
+		.OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase)
+		.ToList();
+	var ungroupedProjects = projects
+		.Where(project => string.IsNullOrWhiteSpace(project.Group))
+		.OrderBy(project => project.Name, StringComparer.OrdinalIgnoreCase)
+		.ToList();
+
+	if (groups.Count == 0)
+		return SelectProjectFromList(projects, "[green]Select the project you want to deploy:[/]");
+
+	var groupChoices = new Dictionary<string, List<ProjectConfig>>();
+	var mainChoices = new List<string>();
+	foreach (var group in groups)
+	{
+		var choice = $"[cyan]▸ {Markup.Escape(group.Key)}[/]";
+		groupChoices.Add(choice, group.OrderBy(project => project.Name, StringComparer.OrdinalIgnoreCase).ToList());
+		mainChoices.Add(choice);
+	}
+
+	var projectChoices = new Dictionary<string, ProjectConfig>();
+	foreach (var project in ungroupedProjects)
+	{
+		var choice = $"[white]{Markup.Escape(project.Name)}[/]";
+		projectChoices.Add(choice, project);
+		mainChoices.Add(choice);
+	}
+
+	const string exitChoice = "[red]Exit[/]";
+	mainChoices.Add(exitChoice);
+	var selected = AnsiConsole.Prompt(
+		new SelectionPrompt<string>()
+			.Title("[green]Select a site or project:[/]")
+			.PageSize(12)
+			.AddChoices(mainChoices));
+
+	if (selected == exitChoice)
+		return null;
+	if (projectChoices.TryGetValue(selected, out var directProject))
+		return directProject;
+
+	var selectedGroup = groupChoices[selected];
+	return SelectProjectFromList(selectedGroup, $"[green]Select an item from[/] [cyan]{Markup.Escape(selectedGroup[0].Group!)}[/]:", "[grey]← Back[/]")
+		?? SelectProject(projects);
+}
+
+static ProjectConfig? SelectProjectFromList(List<ProjectConfig> projects, string title, string cancelChoice = "[red]Exit[/]")
+{
+	var projectChoices = new Dictionary<string, ProjectConfig>();
+	foreach (var project in projects.OrderBy(project => project.Name, StringComparer.OrdinalIgnoreCase))
+	{
+		var choice = $"[white]{Markup.Escape(project.Name)}[/]";
+		projectChoices.Add(choice, project);
+	}
+
+	projectChoices.Add(cancelChoice, null!);
+	var selected = AnsiConsole.Prompt(
+		new SelectionPrompt<string>()
+			.Title(title)
+			.PageSize(12)
+			.AddChoices(projectChoices.Keys));
+
+	return projectChoices[selected];
+}
+
 static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig project)
 {
 	bool backToMainMenu = false;
@@ -357,24 +416,47 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 	}
 
 	// 3. Start the deployment pipeline
-	await AnsiConsole.Live(new Markup("[grey]Initializing...[/]"))
-		.AutoClear(false)
+	var dashboard = new DeploymentDashboard();
+	var finalResult = "[bold red]❌ Deployment ended before a result was recorded.[/]";
+	await AnsiConsole.Live(dashboard.Render())
+		.AutoClear(true)
 		.StartAsync(async live =>
 		{
-			var displayLines = new List<string>();
-			Action renderDisplay = () =>
-				live.UpdateTarget(new Rows(displayLines.Select(line => new Markup(line))));
+			var renderLock = new Lock();
+			using var refreshCts = new CancellationTokenSource();
+			var refreshTask = Task.Run(async () =>
+			{
+				while (!refreshCts.IsCancellationRequested)
+				{
+					lock (renderLock)
+						live.UpdateTarget(dashboard.Render(advanceSpinner: true));
+					await Task.Delay(80, refreshCts.Token).ConfigureAwait(false);
+				}
+			});
+
 			Action<string> status = text =>
 			{
-				displayLines.Add(text);
-				while (displayLines.Count > 18)
-					displayLines.RemoveAt(0);
-				renderDisplay();
+				lock (renderLock)
+				{
+					dashboard.SetStage(text);
+					live.UpdateTarget(dashboard.Render());
+				}
+			};
+			Action<string> commandOutput = text =>
+			{
+				lock (renderLock)
+				{
+					dashboard.AddCommandOutput(text);
+					live.UpdateTarget(dashboard.Render());
+				}
 			};
 			Action clearCommandOutput = () =>
 			{
-				displayLines.Clear();
-				renderDisplay();
+				lock (renderLock)
+				{
+					dashboard.ClearCommandOutput();
+					live.UpdateTarget(dashboard.Render());
+				}
 			};
 			bool servicesWereStopped = false;
 			bool wasDeltaUploadedSuccessfully = false;
@@ -384,7 +466,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 				if (project.LocalPreDeployCommands.Count != 0)
 				{
 					status("[magenta]Executing LOCAL Pre-Deploy commands...[/]");
-					await ExecuteLocalCommandsAsync(project.LocalPreDeployCommands, "Local Pre-Deploy", status, clearCommandOutput);
+					await ExecuteLocalCommandsAsync(project.LocalPreDeployCommands, "Local Pre-Deploy", status, commandOutput, clearCommandOutput);
 					status("[grey]✓ Local Pre-Deploy commands executed successfully.[/]");
 				}
 
@@ -428,15 +510,12 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 				if (deltaFiles.Count == 0 && extraFileCount == 0)
 				{
 					status("[bold green]✓ Everything is up to date! No deployment needed.[/]");
+					finalResult = "[bold yellow]↔ No deployment was needed; the server is already up to date.[/]";
 					return;
 				}
 				status($"[grey]Delta identified: {deltaFiles.Count} local files need uploading and {extraFileCount} extra server files will be deleted.[/]");
 
-				// This acts as an eraser and completely overwrites the old "Comparing..." text.
 				status("[yellow]Zipping and uploading delta files...[/]");
-
-				// Print an empty line to push the cursor down
-				AnsiConsole.WriteLine();
 
 				var table = new Table()
 					.Border(TableBorder.Rounded)
@@ -463,22 +542,37 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 					table.AddRow("[grey]...[/]", $"[grey]... and {deltaFiles.Count - maxDisplay} more files hidden for performance.[/]");
 				}
 
+				lock (renderLock)
+				{
+					dashboard.SetDeltaFiles(table);
+					live.UpdateTarget(dashboard.Render());
+				}
 				status($"[grey]Preparing {deltaFiles.Count} changed files for upload...[/]");
 
-				// Pass the version variable here
-				await UploadDeltaZipAsync(httpClient, project, deltaFiles, compareResult?.SyncManifestId, version, status);
+				await UploadDeltaZipAsync(httpClient, project, deltaFiles, compareResult?.SyncManifestId, version, status, (percent, text) =>
+				{
+					lock (renderLock)
+					{
+						dashboard.SetUploadProgress(percent, text);
+						live.UpdateTarget(dashboard.Render());
+					}
+				});
 				status("[grey]Files uploaded and extracted successfully.[/]");
 
 				wasDeltaUploadedSuccessfully = true;
 
 				status("[bold green]🚀 Deployment Completed Successfully![/]");
+				finalResult = "[bold green]✓ Deployment completed successfully.[/]";
 			}
 			catch (Exception ex)
 			{
 				status($"[bold red]❌ Deployment Failed:[/] {Markup.Escape(ex.Message)}");
+				finalResult = $"[bold red]❌ Deployment failed:[/] {Markup.Escape(ex.Message)}";
 			}
 			finally
 			{
+				try
+				{
 				// Local Post-Deploy commands
 				bool shouldRunLocalPostDeploy = project.LocalPostDeployCommands.Count != 0 &&
 												(project.AlwaysRunPostDeployCommands || wasDeltaUploadedSuccessfully);
@@ -488,7 +582,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 					status("[magenta]Executing LOCAL Post-Deploy commands...[/]");
 					try
 					{
-						await ExecuteLocalCommandsAsync(project.LocalPostDeployCommands, "Local Post-Deploy", status, clearCommandOutput);
+						await ExecuteLocalCommandsAsync(project.LocalPostDeployCommands, "Local Post-Deploy", status, commandOutput, clearCommandOutput);
 						status("[grey]✓ Local Post-Deploy commands executed successfully.[/]");
 					}
 					catch (Exception localEx)
@@ -530,10 +624,27 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 					catch (Exception finalEx)
 					{
 						status($"[bold white on red] CRITICAL ERROR: Could not restart services. Manual intervention required! [/] {Markup.Escape(finalEx.Message)}");
+						finalResult = $"[bold red]❌ Deployment requires manual intervention:[/] services could not be restarted. {Markup.Escape(finalEx.Message)}";
 					}
 				}
+				}
+			finally
+			{
+				refreshCts.Cancel();
+				try
+				{
+					await refreshTask;
+				}
+				catch (OperationCanceledException)
+				{
+				}
+			}
 			}
 		});
+
+	AnsiConsole.Write(new Panel(new Markup(finalResult))
+		.Header("[bold cyan]Deployment result[/]")
+		.Border(BoxBorder.Rounded));
 }
 
 static Dictionary<string, string> GetLocalFileHashes(string basePath, List<string> ignoredPaths)
@@ -569,7 +680,7 @@ static Dictionary<string, string> GetLocalFileHashes(string basePath, List<strin
 	return hashes.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
 }
 
-static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, List<string> deltaFiles, string? syncManifestId, string version, Action<string> status)
+static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, List<string> deltaFiles, string? syncManifestId, string version, Action<string> status, Action<int, string> uploadProgress)
 {
 	var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
 	var zipPath = tempDir + ".zip";
@@ -596,7 +707,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 
 		try
 		{
-			await UploadResumableAsync(client, project, syncManifestId, version, zipPath, status);
+			await UploadResumableAsync(client, project, syncManifestId, version, zipPath, status, uploadProgress);
 		}
 		catch
 		{
@@ -608,7 +719,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 	{
 		if (preserveUploadArtifact)
 		{
-			AnsiConsole.MarkupLine("[yellow]Upload paused. The local upload artifact is preserved for a future resume.[/]");
+			status("[yellow]Upload paused. The local upload artifact is preserved for a future resume.[/]");
 		}
 		else if (Directory.Exists(tempDir))
 		{
@@ -695,7 +806,7 @@ static async Task ManualExecuteCommandsAsync(HttpClient client, string projectNa
 		});
 }
 
-static async Task ExecuteLocalCommandsAsync(List<LocalCommandConfig> commands, string label, Action<string>? status = null, Action? clearAfterCommand = null)
+static async Task ExecuteLocalCommandsAsync(List<LocalCommandConfig> commands, string label, Action<string>? status = null, Action<string>? commandOutput = null, Action? clearAfterCommand = null)
 {
 	int index = 0;
 	foreach (var cmd in commands)
@@ -727,12 +838,12 @@ static async Task ExecuteLocalCommandsAsync(List<LocalCommandConfig> commands, s
 		var stdOutTask = ReadProcessOutputAsync(process.StandardOutput, line =>
 			{
 				output.Add(line);
-				ShowLocalProcessLog(status, label, index, line);
+				ShowLocalProcessLog(status, commandOutput, line);
 			});
 		var stdErrTask = ReadProcessOutputAsync(process.StandardError, line =>
 			{
 				errorOutput.Add(line);
-				ShowLocalProcessLog(status, label, index, line, isError: true);
+				ShowLocalProcessLog(status, commandOutput, line, isError: true);
 			});
 			await Task.WhenAll(stdOutTask, stdErrTask, process.WaitForExitAsync());
 
@@ -749,14 +860,16 @@ static async Task ExecuteLocalCommandsAsync(List<LocalCommandConfig> commands, s
 		}
 }
 
-static void ShowLocalProcessLog(Action<string>? status, string label, int index, string line, bool isError = false)
+static void ShowLocalProcessLog(Action<string>? status, Action<string>? commandOutput, string line, bool isError = false)
 {
 	if (string.IsNullOrWhiteSpace(line))
 		return;
 
 	var text = line.Length > 400 ? line[..400] + "..." : line;
 	var markup = Markup.Escape(text);
-	if (status != null)
+	if (commandOutput != null)
+		commandOutput(markup);
+	else if (status != null)
 		status(markup);
 	else
 		AnsiConsole.MarkupLine(markup);
@@ -775,7 +888,7 @@ static async Task ManualExecuteLocalCommandsAsync(List<LocalCommandConfig> comma
 	}
 }
 
-static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string? syncManifestId, string version, string zipPath, Action<string> uploadStatus)
+static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string? syncManifestId, string version, string zipPath, Action<string> uploadStatus, Action<int, string> uploadProgress)
 {
 	const int chunkSize = 8 * 1024 * 1024;
 	var totalBytes = new FileInfo(zipPath).Length;
@@ -797,7 +910,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 			{
 				session = new UploadSessionResponse(manifest.UploadId, existingStatus.ChunkSize, existingStatus.TotalChunks);
 				uploadZipPath = manifest.ZipPath;
-				AnsiConsole.MarkupLine($"[cyan]Resuming upload session:[/] [yellow]{existingStatus.UploadedChunks.Length}/{existingStatus.TotalChunks} chunks already uploaded.[/]");
+				uploadStatus($"[cyan]Resuming upload session:[/] [yellow]{existingStatus.UploadedChunks.Length}/{existingStatus.TotalChunks} chunks already uploaded.[/]");
 			}
 		}
 	}
@@ -823,7 +936,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 			ZipPath = zipPath
 		};
 		await SavePendingUploadManifestAsync(manifestPath, manifest);
-		AnsiConsole.MarkupLine($"[cyan]Started new upload session:[/] [yellow]0/{session.TotalChunks} chunks uploaded.[/]");
+		uploadStatus($"[cyan]Started new upload session:[/] [yellow]0/{session.TotalChunks} chunks uploaded.[/]");
 	}
 
 	using var statusResponse = await client.GetAsync($"api/upload/sessions/{session.UploadId}");
@@ -876,7 +989,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 
 					var speedMegabytes = smoothedBytesPerSecond / 1048576d;
 					var speedMegabits = smoothedBytesPerSecond * 8 / 1000000d;
-					uploadStatus($"Uploading delta.zip... {percent}% ({uploaded / 1048576d:F2} MB / {totalBytes / 1048576d:F2} MB) {speedMegabytes:F2} MB/s ({speedMegabits:F2} Mbps)");
+					uploadProgress(percent, $"Uploading delta.zip... {percent}% ({uploaded / 1048576d:F2} MB / {totalBytes / 1048576d:F2} MB) {speedMegabytes:F2} MB/s ({speedMegabits:F2} Mbps)");
 				}));
 				content.Headers.ContentLength = length;
 
@@ -963,4 +1076,81 @@ static async Task<string> ComputeFileHashAsync(string path)
 	await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
 	using var sha256 = SHA256.Create();
 	return Convert.ToHexStringLower(await sha256.ComputeHashAsync(stream));
+}
+
+sealed class DeploymentDashboard
+{
+	private static readonly string[] SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+	private readonly List<string> commandOutput = [];
+	private string stage = "[grey]Initializing deployment pipeline...[/]";
+	private string? uploadDetails;
+	private Table? deltaFiles;
+	private int uploadPercent;
+	private int spinnerFrame;
+
+	public void SetStage(string value)
+	{
+		stage = value;
+	}
+
+	public void SetDeltaFiles(Table value)
+	{
+		deltaFiles = value;
+	}
+
+	public void SetUploadProgress(int percent, string details)
+	{
+		uploadPercent = Math.Clamp(percent, 0, 100);
+		uploadDetails = Markup.Escape(details);
+		stage = "[blue]Uploading deployment package...[/]";
+	}
+
+	public void AddCommandOutput(string line)
+	{
+		commandOutput.Add(line);
+		while (commandOutput.Count > 12)
+			commandOutput.RemoveAt(0);
+	}
+
+	public void ClearCommandOutput()
+	{
+		commandOutput.Clear();
+	}
+
+	public IRenderable Render(bool advanceSpinner = false)
+	{
+		if (advanceSpinner)
+			spinnerFrame = (spinnerFrame + 1) % SpinnerFrames.Length;
+
+		var content = new List<IRenderable>
+		{
+			new Panel(new Markup($"[magenta]{SpinnerFrames[spinnerFrame]}[/] {stage}"))
+				.Header("[bold cyan]Deployment status[/]")
+				.Border(BoxBorder.Rounded)
+		};
+
+		if (uploadDetails != null)
+		{
+			const int width = 36;
+			var filled = (int)Math.Round(width * (uploadPercent / 100d));
+			var bar = new string('█', filled) + new string('░', width - filled);
+			content.Add(new Panel(new Rows(
+				new Markup($"[green]{bar}[/] [bold yellow]{uploadPercent}%[/]"),
+				new Markup($"[grey]{uploadDetails}[/]")))
+				.Header("[bold cyan]Upload progress[/]")
+				.Border(BoxBorder.Rounded));
+		}
+
+		if (deltaFiles != null)
+			content.Add(deltaFiles);
+
+		if (commandOutput.Count != 0)
+		{
+			content.Add(new Panel(new Rows(commandOutput.Select(line => new Markup(line))))
+				.Header("[bold magenta]Live local command output[/]")
+				.Border(BoxBorder.Rounded));
+		}
+
+		return new Rows(content);
+	}
 }
