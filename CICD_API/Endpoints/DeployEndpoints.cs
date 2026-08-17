@@ -1,6 +1,7 @@
 ﻿using CICD_API.Models;
 using Microsoft.AspNetCore.Mvc;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO.Compression;
 using System.Security.Cryptography;
 using System.ServiceProcess;
@@ -24,6 +25,9 @@ public static class DeployEndpoints
 
 	private static string GetMetadataPath(string backupDirBase, string projectName)
 		=> Path.Combine(backupDirBase, projectName, "project_metadata.json");
+
+	private static string GetRequestId(HttpRequest request)
+		=> request.Headers["X-Request-Id"].FirstOrDefault() ?? request.HttpContext.TraceIdentifier;
 
 	public static void MapDeployEndpoints(this IEndpointRouteBuilder app)
 	{
@@ -485,20 +489,33 @@ public static class DeployEndpoints
 
 	private static void MapResumableUploadEndpoints(IEndpointRouteBuilder app)
 	{
-		app.MapPost("/api/upload/sessions", (CreateUploadSessionRequest request, IConfiguration config, ILogger<Program> logger) =>
+		app.MapPost("/api/upload/sessions", (CreateUploadSessionRequest request, HttpRequest httpRequest, IConfiguration config, ILogger<Program> logger) =>
 		{
+			var requestId = GetRequestId(httpRequest);
 			var allowedDirs = config.GetSection("AllowedDirectories").Get<Dictionary<string, string>>();
 			var maxUploadBytes = config.GetValue<long?>("MaxUploadBytes") ?? 10L * 1024 * 1024 * 1024;
 			var maxChunkSize = config.GetValue<int?>("UploadChunkSizeBytes") ?? 8 * 1024 * 1024;
 
 			if (allowedDirs == null || !allowedDirs.ContainsKey(request.ProjectName))
+			{
+				logger.LogWarning("Upload session rejected. RequestId: {RequestId}; Reason: Project not defined; Project: {ProjectName}", requestId, request.ProjectName);
 				return Results.BadRequest("Project not defined.");
+			}
 			if (request.TotalBytes <= 0 || request.TotalBytes > maxUploadBytes)
+			{
+				logger.LogWarning("Upload session rejected. RequestId: {RequestId}; Reason: Invalid total size; Project: {ProjectName}; TotalBytes: {TotalBytes}; MaxUploadBytes: {MaxUploadBytes}", requestId, request.ProjectName, request.TotalBytes, maxUploadBytes);
 				return Results.BadRequest("Upload size is invalid or exceeds the server limit.");
+			}
 			if (request.ChunkSize <= 0)
+			{
+				logger.LogWarning("Upload session rejected. RequestId: {RequestId}; Reason: Invalid chunk size; Project: {ProjectName}; ChunkSize: {ChunkSize}", requestId, request.ProjectName, request.ChunkSize);
 				return Results.BadRequest("Chunk size must be positive.");
+			}
 			if (string.IsNullOrWhiteSpace(request.FileHash) || request.FileHash.Length != 64)
+			{
+				logger.LogWarning("Upload session rejected. RequestId: {RequestId}; Reason: Invalid file hash length; Project: {ProjectName}; HashLength: {HashLength}", requestId, request.ProjectName, request.FileHash?.Length ?? 0);
 				return Results.BadRequest("A SHA-256 file hash is required.");
+			}
 
 			var normalizedRequest = request with { ChunkSize = Math.Min(request.ChunkSize, maxChunkSize) };
 			if (request.MirrorServerToLocal)
@@ -517,7 +534,7 @@ public static class DeployEndpoints
 				};
 			}
 			var session = UploadSessionStore.Create(normalizedRequest);
-			logger.LogInformation("Created resumable upload session {UploadId} for project '{ProjectName}'.", session.Metadata.UploadId, request.ProjectName);
+			logger.LogInformation("Created resumable upload session. RequestId: {RequestId}; UploadId: {UploadId}; Project: {ProjectName}; TotalBytes: {TotalBytes}; ChunkSize: {ChunkSize}; TotalChunks: {TotalChunks}", requestId, session.Metadata.UploadId, request.ProjectName, session.Metadata.TotalBytes, session.Metadata.ChunkSize, GetTotalChunks(session.Metadata));
 			return Results.Ok(new
 			{
 				UploadId = session.Metadata.UploadId,
@@ -526,11 +543,15 @@ public static class DeployEndpoints
 			});
 		});
 
-		app.MapGet("/api/upload/sessions/{uploadId}", (string uploadId) =>
+		app.MapGet("/api/upload/sessions/{uploadId}", (string uploadId, HttpRequest httpRequest, ILogger<Program> logger) =>
 		{
+			var requestId = GetRequestId(httpRequest);
 			var session = UploadSessionStore.Get(uploadId);
 			if (session == null)
+			{
+				logger.LogWarning("Upload session lookup failed. RequestId: {RequestId}; UploadId: {UploadId}; Reason: Session not found", requestId, uploadId);
 				return Results.NotFound("Upload session not found.");
+			}
 
 			lock (session.SyncRoot)
 			{
@@ -545,25 +566,41 @@ public static class DeployEndpoints
 			}
 		});
 
-		app.MapPut("/api/upload/sessions/{uploadId}/chunks/{chunkIndex:int}", async (string uploadId, int chunkIndex, HttpRequest request, ILogger<Program> logger) =>
+		app.MapMethods("/api/upload/sessions/{uploadId}/chunks/{chunkIndex:int}", new[] { HttpMethods.Put, HttpMethods.Post }, async (string uploadId, int chunkIndex, HttpRequest request, ILogger<Program> logger) =>
 		{
+			var requestId = GetRequestId(request);
+			var stopwatch = Stopwatch.StartNew();
+			var requestContentLength = request.ContentLength;
 			var session = UploadSessionStore.Get(uploadId);
 			if (session == null)
+			{
+				logger.LogWarning("Chunk rejected. RequestId: {RequestId}; UploadId: {UploadId}; ChunkIndex: {ChunkIndex}; Status: 404; Reason: Session not found; ContentLength: {ContentLength}", requestId, uploadId, chunkIndex, requestContentLength);
 				return Results.NotFound("Upload session not found.");
+			}
 
 			var metadata = session.Metadata;
 			var totalChunks = GetTotalChunks(metadata);
+			logger.LogInformation("Chunk received. RequestId: {RequestId}; UploadId: {UploadId}; Project: {ProjectName}; ChunkIndex: {ChunkIndex}; TotalChunks: {TotalChunks}; ExpectedLength: {ExpectedLength}; ContentLength: {ContentLength}; TransferEncoding: {TransferEncoding}", requestId, uploadId, metadata.ProjectName, chunkIndex, totalChunks, GetChunkLength(metadata, Math.Clamp(chunkIndex, 0, Math.Max(0, totalChunks - 1))), requestContentLength, request.Headers["Transfer-Encoding"].ToString());
 			if (chunkIndex < 0 || chunkIndex >= totalChunks)
+			{
+				logger.LogWarning("Chunk rejected. RequestId: {RequestId}; UploadId: {UploadId}; ChunkIndex: {ChunkIndex}; TotalChunks: {TotalChunks}; Status: 400; Reason: Chunk index outside range", requestId, uploadId, chunkIndex, totalChunks);
 				return Results.BadRequest("Chunk index is outside the upload range.");
+			}
 
 			var expectedLength = GetChunkLength(metadata, chunkIndex);
-			if (request.ContentLength != expectedLength)
-				return Results.BadRequest($"Expected chunk length {expectedLength}, received {request.ContentLength ?? 0}.");
+			if (requestContentLength != expectedLength)
+			{
+				logger.LogWarning("Chunk rejected. RequestId: {RequestId}; UploadId: {UploadId}; ChunkIndex: {ChunkIndex}; Status: 400; Reason: Content length mismatch; ExpectedLength: {ExpectedLength}; ContentLength: {ContentLength}", requestId, uploadId, chunkIndex, expectedLength, requestContentLength);
+				return Results.BadRequest($"Expected chunk length {expectedLength}, received {requestContentLength ?? 0}.");
+			}
 
 			lock (session.SyncRoot)
 			{
 				if (metadata.UploadedChunks.Contains(chunkIndex))
+				{
+					logger.LogInformation("Chunk already uploaded. RequestId: {RequestId}; UploadId: {UploadId}; ChunkIndex: {ChunkIndex}", requestId, uploadId, chunkIndex);
 					return Results.Ok(new { ChunkIndex = chunkIndex, AlreadyUploaded = true });
+				}
 			}
 
 			try
@@ -580,30 +617,41 @@ public static class DeployEndpoints
 						metadata.UploadedChunks.Add(chunkIndex);
 					UploadSessionStore.Save(session);
 				}
+				stopwatch.Stop();
+				logger.LogInformation("Chunk saved. RequestId: {RequestId}; UploadId: {UploadId}; ChunkIndex: {ChunkIndex}; Bytes: {Bytes}; ElapsedMs: {ElapsedMs}; UploadedChunks: {UploadedChunks}/{TotalChunks}", requestId, uploadId, chunkIndex, expectedLength, stopwatch.ElapsedMilliseconds, metadata.UploadedChunks.Count, totalChunks);
 
 				return Results.Ok(new { ChunkIndex = chunkIndex, AlreadyUploaded = false });
 			}
 			catch (OperationCanceledException)
 			{
+				logger.LogWarning("Chunk canceled. RequestId: {RequestId}; UploadId: {UploadId}; ChunkIndex: {ChunkIndex}; ElapsedMs: {ElapsedMs}; RequestAborted: {RequestAborted}", requestId, uploadId, chunkIndex, stopwatch.ElapsedMilliseconds, request.HttpContext.RequestAborted.IsCancellationRequested);
 				return Results.StatusCode(StatusCodes.Status499ClientClosedRequest);
 			}
 			catch (Exception ex)
 			{
-				logger.LogError(ex, "Failed to write chunk {ChunkIndex} for upload {UploadId}.", chunkIndex, uploadId);
+				logger.LogError(ex, "Chunk save failed. RequestId: {RequestId}; UploadId: {UploadId}; ChunkIndex: {ChunkIndex}; ElapsedMs: {ElapsedMs}; ContentLength: {ContentLength}", requestId, uploadId, chunkIndex, stopwatch.ElapsedMilliseconds, requestContentLength);
 				return Results.Problem("The upload chunk could not be saved.");
 			}
 		});
 
-		app.MapPost("/api/upload/sessions/{uploadId}/complete", async (string uploadId, IConfiguration config, ILogger<Program> logger) =>
+		app.MapPost("/api/upload/sessions/{uploadId}/complete", async (string uploadId, HttpRequest request, IConfiguration config, ILogger<Program> logger) =>
 		{
+			var requestId = GetRequestId(request);
+			var stopwatch = Stopwatch.StartNew();
 			var session = UploadSessionStore.Get(uploadId);
 			if (session == null)
+			{
+				logger.LogWarning("Upload completion rejected. RequestId: {RequestId}; UploadId: {UploadId}; Status: 404; Reason: Session not found", requestId, uploadId);
 				return Results.NotFound("Upload session not found.");
+			}
 
 			lock (session.SyncRoot)
 			{
 				if (session.Metadata.UploadedChunks.Count != GetTotalChunks(session.Metadata))
+				{
+					logger.LogWarning("Upload completion rejected. RequestId: {RequestId}; UploadId: {UploadId}; Status: 409; Reason: Incomplete upload; UploadedChunks: {UploadedChunks}; TotalChunks: {TotalChunks}", requestId, uploadId, session.Metadata.UploadedChunks.Count, GetTotalChunks(session.Metadata));
 					return Results.Conflict("The upload is incomplete.");
+				}
 			}
 
 			try
@@ -613,16 +661,21 @@ public static class DeployEndpoints
 					using var sha256 = SHA256.Create();
 					var actualHash = Convert.ToHexStringLower(await sha256.ComputeHashAsync(stream));
 					if (!actualHash.Equals(session.Metadata.FileHash, StringComparison.OrdinalIgnoreCase))
+					{
+						logger.LogWarning("Upload integrity check failed. RequestId: {RequestId}; UploadId: {UploadId}; ExpectedHashPrefix: {ExpectedHashPrefix}; ActualHashPrefix: {ActualHashPrefix}", requestId, uploadId, session.Metadata.FileHash[..Math.Min(12, session.Metadata.FileHash.Length)], actualHash[..12]);
 						return Results.Problem("Upload integrity verification failed.", statusCode: StatusCodes.Status422UnprocessableEntity);
+					}
 				}
 
 				await ProcessUploadedZipAsync(session.PartFilePath, session.Metadata.ProjectName, session.Metadata.Version, session.Metadata.EnableBackup, session.Metadata.MirrorServerToLocal, session.Metadata.IgnoredFiles, session.Metadata.SynchronizedFiles, config, logger);
 				UploadSessionStore.Delete(session);
+				stopwatch.Stop();
+				logger.LogInformation("Upload completed and processed. RequestId: {RequestId}; UploadId: {UploadId}; Project: {ProjectName}; ElapsedMs: {ElapsedMs}", requestId, uploadId, session.Metadata.ProjectName, stopwatch.ElapsedMilliseconds);
 				return Results.Ok();
 			}
 			catch (Exception ex)
 			{
-				logger.LogError(ex, "Failed to complete resumable upload {UploadId}.", uploadId);
+				logger.LogError(ex, "Upload completion failed. RequestId: {RequestId}; UploadId: {UploadId}; ElapsedMs: {ElapsedMs}", requestId, uploadId, stopwatch.ElapsedMilliseconds);
 				return Results.Problem($"Server Error Details: {ex.Message}");
 			}
 		});

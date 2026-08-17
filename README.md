@@ -15,6 +15,7 @@ Created with ❤️ by **Morteza Mirshekar**.
 * **⚙️ Automated Service Management:** Safely stops required Windows Services before deploying and restarts them automatically afterward.
 * **⏪ Auto-Backups & 1-Click Rollbacks:** Every deployment automatically creates a `.zip` backup of your server's current state. Broke something? Roll back instantly via the interactive menu.
 * **🪝 Pre & Post Deploy Hooks:** Run automated CLI commands (like database migrations or npm scripts) on the server before or after your code is uploaded.
+* **🗃️ Server-side Migration Manager:** Shows EF Core migration history and runs only a preconfigured SQL script against the database from the deployment server.
 * **🎨 Beautiful Interactive UI:** Powered by `Spectre.Console`, the client gives you a gorgeous, menu-driven interface with live progress bars—no memorizing complex CLI arguments!
 
 ## 📸 Screenshots
@@ -111,6 +112,13 @@ On your local machine (or build server), place the following `appsettings.json` 
 * `ServicesToManage`: A list of Windows Services to stop before deployment and start afterward.
 * `IgnoredFiles`: Files or folders you *never* want to upload (e.g., local dev configs).
 * `PreDeployCommands` / `PostDeployCommands`: CLI commands to execute on the server.
+* `MigrationProfile` / `MigrationExecutionKey`: Enables the Migration Manager for this project. This is deliberately separate from the normal deployment key.
+
+### Server-side database migrations
+
+Create an idempotent EF Core SQL script locally (for example, `dotnet ef migrations script --idempotent --output database/migrations.sql`). Set its local path in the client project configuration. FastCICD securely uploads it to the API's dedicated migration storage directory; configure only the database connection string in the server's `appsettings.json` under `MigrationProfiles`. Do not put a connection string in the client configuration.
+
+The Migration Manager menu compares the local script hash with the server copy, requires a separate explicit confirmation before upload and before execution, then reads `__EFMigrationsHistory` and applies only pending blocks. SQL is accepted only as a signed EF Core migration script for a configured profile; the connection string never leaves the server. Migration requests require HTTPS by default, normal API authentication, an independent migration key, a short-lived HMAC over method/path/content hash, and a single-use nonce. The server verifies the uploaded file hash, stores it outside the deployment directory, serializes executions with a SQL Server application lock, and logs all upload/execution outcomes without logging secrets. Restrict NTFS access to `MigrationScriptStorageDirectory` to the API service identity and administrators. Give the configured database login only the schema permissions needed by the migrations, use encrypted connections, and retain normal database backups: schema migrations are not reversible automatically.
 
 ---
 
