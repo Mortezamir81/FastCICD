@@ -13,6 +13,8 @@ using Spectre.Console.Rendering;
 
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 
+const int DefaultUploadChunkSizeBytes = 8 * 1024 * 1024;
+
 var config = new ConfigurationBuilder()
 	.SetBasePath(Directory.GetCurrentDirectory())
 	.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
@@ -22,6 +24,7 @@ var settings = config.GetSection("DeployerSettings");
 var endpoint = settings["ServerEndpoint"]!;
 var apiKey = settings["SecurityKey"]!;
 var projects = settings.GetSection("Projects").Get<List<ProjectConfig>>()!;
+var uploadChunkSizeBytes = GetUploadChunkSizeBytes(settings);
 
 if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(apiKey) || projects == null || projects.Count == 0)
 {
@@ -42,6 +45,7 @@ while (true)
 	settings = config.GetSection("DeployerSettings");
 	endpoint = settings["ServerEndpoint"] ?? endpoint;
 	projects = settings.GetSection("Projects").Get<List<ProjectConfig>>() ?? [];
+	uploadChunkSizeBytes = GetUploadChunkSizeBytes(settings);
 	if (Uri.TryCreate(endpoint, UriKind.Absolute, out var refreshedEndpoint))
 		httpClient.BaseAddress = refreshedEndpoint;
 	var refreshedApiKey = settings["SecurityKey"];
@@ -69,7 +73,7 @@ while (true)
 		break;
 	}
 
-	await HandleProjectMenuAsync(httpClient, project);
+	await HandleProjectMenuAsync(httpClient, project, uploadChunkSizeBytes);
 
 
 }
@@ -144,7 +148,7 @@ static ProjectConfig? SelectProjectFromList(List<ProjectConfig> projects, string
 	return projectChoices[selected];
 }
 
-static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig project)
+static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig project, int uploadChunkSizeBytes)
 {
 	bool backToMainMenu = false;
 
@@ -192,7 +196,7 @@ static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig projec
 		switch (projectAction)
 		{
 			case MenuOptions.Deploy:
-				await ExecuteDeploymentPipelineAsync(client, project);
+				await ExecuteDeploymentPipelineAsync(client, project, uploadChunkSizeBytes);
 				break;
 
 			case MenuOptions.CheckStatus:
@@ -388,7 +392,7 @@ static async Task HandleRollbackAsync(HttpClient client, ProjectConfig project)
 	}
 }
 
-static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectConfig project)
+static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectConfig project, int uploadChunkSizeBytes)
 {
 	string version = ""; // Default empty version for when rollback is disabled
 
@@ -543,7 +547,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 				}
 				status($"[grey]Preparing {deltaFiles.Count} changed files for upload...[/]");
 
-				await UploadDeltaZipAsync(httpClient, project, deltaFiles, compareResult?.SyncManifestId, version, status, (percent, text) =>
+				await UploadDeltaZipAsync(httpClient, project, deltaFiles, compareResult?.SyncManifestId, version, uploadChunkSizeBytes, status, (percent, text) =>
 				{
 					lock (renderLock)
 					{
@@ -792,7 +796,7 @@ static Dictionary<string, string> GetLocalFileHashes(string basePath, List<strin
 	return hashes.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
 }
 
-static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, List<string> deltaFiles, string? syncManifestId, string version, Action<string> status, Action<int, string> uploadProgress)
+static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, List<string> deltaFiles, string? syncManifestId, string version, int uploadChunkSizeBytes, Action<string> status, Action<int, string> uploadProgress)
 {
 	var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
 	var zipPath = tempDir + ".zip";
@@ -819,7 +823,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 
 		try
 		{
-			await UploadResumableAsync(client, project, syncManifestId, version, zipPath, status, uploadProgress);
+			await UploadResumableAsync(client, project, syncManifestId, version, zipPath, uploadChunkSizeBytes, status, uploadProgress);
 		}
 		catch
 		{
@@ -1000,9 +1004,8 @@ static async Task ManualExecuteLocalCommandsAsync(List<LocalCommandConfig> comma
 	}
 }
 
-static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string? syncManifestId, string version, string zipPath, Action<string> uploadStatus, Action<int, string> uploadProgress)
+static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string? syncManifestId, string version, string zipPath, int chunkSize, Action<string> uploadStatus, Action<int, string> uploadProgress)
 {
-	const int chunkSize = 512 * 1024;
 	var totalBytes = new FileInfo(zipPath).Length;
 	var fileHash = await ComputeFileHashAsync(zipPath);
 	var manifestPath = GetPendingUploadManifestPath(project, version, fileHash, chunkSize);
@@ -1145,6 +1148,18 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 	await DeletePendingUploadManifestAsync(manifestPath);
 	if (!string.Equals(uploadZipPath, zipPath, StringComparison.OrdinalIgnoreCase) && File.Exists(uploadZipPath))
 		File.Delete(uploadZipPath);
+}
+
+static int GetUploadChunkSizeBytes(IConfigurationSection settings)
+{
+	var rawValue = settings["UploadChunkSizeBytes"];
+	if (string.IsNullOrWhiteSpace(rawValue))
+		return DefaultUploadChunkSizeBytes;
+
+	if (!int.TryParse(rawValue, out var chunkSize) || chunkSize <= 0)
+		throw new InvalidOperationException("DeployerSettings:UploadChunkSizeBytes must be a positive integer.");
+
+	return chunkSize;
 }
 
 static void LogUploadDiagnostic(string message)
