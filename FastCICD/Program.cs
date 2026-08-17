@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 using FastCICD;
+using FastCICD.Models;
 using Microsoft.Extensions.Configuration;
 using Spectre.Console;
 using Spectre.Console.Rendering;
@@ -177,6 +178,8 @@ static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig projec
 		{
 			menuChoices.Add(MenuOptions.Rollback);
 		}
+		if (!string.IsNullOrWhiteSpace(project.MigrationProfile))
+			menuChoices.Add(MenuOptions.ManageMigrations);
 
 		menuChoices.Add(MenuOptions.Back);
 
@@ -226,6 +229,10 @@ static async Task HandleProjectMenuAsync(HttpClient client, ProjectConfig projec
 
 			case MenuOptions.Rollback:
 				await HandleRollbackAsync(client, project);
+				break;
+
+			case MenuOptions.ManageMigrations:
+				await HandleMigrationManagerAsync(client, project);
 				break;
 
 			case MenuOptions.Back:
@@ -517,34 +524,21 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 
 				status("[yellow]Zipping and uploading delta files...[/]");
 
-				var table = new Table()
-					.Border(TableBorder.Rounded)
-					.BorderColor(Color.Grey)
-					.AddColumn(new TableColumn("[cyan]Directory[/]"))
-					.AddColumn(new TableColumn("[green]File Name[/]"));
-
-				int maxDisplay = 100;
-				var displayFiles = deltaFiles.Take(maxDisplay).ToList();
-
-				foreach (var file in displayFiles)
-				{
-					var dir = Path.GetDirectoryName(file);
-					var name = Path.GetFileName(file);
-
-					table.AddRow(
-						string.IsNullOrEmpty(dir) ? "[grey]/ (Root)[/]" : $"[white]{Markup.Escape(dir)}[/]",
-						$"[yellow]{Markup.Escape(name)}[/]"
-					);
-				}
-
-				if (deltaFiles.Count > maxDisplay)
-				{
-					table.AddRow("[grey]...[/]", $"[grey]... and {deltaFiles.Count - maxDisplay} more files hidden for performance.[/]");
-				}
+				var deltaFileRows = deltaFiles
+					.Select(file =>
+					{
+						var dir = Path.GetDirectoryName(file);
+						var name = Path.GetFileName(file);
+						return (
+							Directory: string.IsNullOrEmpty(dir) ? "[grey]/ (Root)[/]" : $"[white]{Markup.Escape(dir)}[/]",
+							FileName: $"[yellow]{Markup.Escape(name)}[/]"
+						);
+					})
+					.ToList();
 
 				lock (renderLock)
 				{
-					dashboard.SetDeltaFiles(table);
+					dashboard.SetDeltaFiles(deltaFileRows);
 					live.UpdateTarget(dashboard.Render());
 				}
 				status($"[grey]Preparing {deltaFiles.Count} changed files for upload...[/]");
@@ -645,6 +639,124 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 	AnsiConsole.Write(new Panel(new Markup(finalResult))
 		.Header("[bold cyan]Deployment result[/]")
 		.Border(BoxBorder.Rounded));
+}
+
+static async Task HandleMigrationManagerAsync(HttpClient client, ProjectConfig project)
+{
+	if (string.IsNullOrWhiteSpace(project.MigrationProfile) || string.IsNullOrWhiteSpace(project.MigrationExecutionKey) || string.IsNullOrWhiteSpace(project.MigrationScriptPath))
+	{
+		AnsiConsole.MarkupLine("[bold red]Migration Manager is not configured for this project.[/]");
+		return;
+	}
+	if (!File.Exists(project.MigrationScriptPath))
+	{
+		AnsiConsole.MarkupLine($"[bold red]Migration script was not found:[/] {Markup.Escape(project.MigrationScriptPath)}");
+		return;
+	}
+
+	try
+	{
+		var localHash = await ComputeFileHashAsync(project.MigrationScriptPath);
+		MigrationStatusResponse? status = null;
+		try { status = await GetMigrationStatusAsync(client, project); }
+		catch (HttpRequestException exception) when (exception.StatusCode == System.Net.HttpStatusCode.NotFound) { }
+
+		if (status is null || !string.Equals(status.ScriptSha256, localHash, StringComparison.OrdinalIgnoreCase))
+		{
+			AnsiConsole.MarkupLine(status is null
+				? "[yellow]No migration script is stored for this profile on the server.[/]"
+				: "[yellow]The server has a different migration script. It will not be applied until you upload this local version.[/]");
+			if (!AnsiConsole.Confirm("[yellow]Upload the local migration script to the remote server?[/]", false)) return;
+			var uploadConfirmation = AnsiConsole.Ask<string>($"Type [bold yellow]{Markup.Escape(project.MigrationProfile)}[/] to authorize script upload:");
+			if (!string.Equals(uploadConfirmation, project.MigrationProfile, StringComparison.Ordinal))
+			{
+				AnsiConsole.MarkupLine("[yellow]Migration script upload cancelled.[/]");
+				return;
+			}
+			var upload = await UploadMigrationScriptAsync(client, project, localHash);
+			AnsiConsole.MarkupLine($"[green]✓ Uploaded {upload.MigrationCount} migration(s). Hash: {upload.ScriptSha256[..12]}…[/]");
+			status = await GetMigrationStatusAsync(client, project);
+		}
+
+		RenderMigrationStatus(status);
+		var pending = status.Migrations.Where(migration => !migration.IsApplied).ToList();
+		if (pending.Count == 0)
+		{
+			AnsiConsole.MarkupLine("[bold green]✓ The configured database is up to date.[/]");
+			return;
+		}
+
+		if (!AnsiConsole.Confirm($"[yellow]Apply {pending.Count} pending migration(s) on the remote server?[/]", false))
+			return;
+		var confirmation = AnsiConsole.Ask<string>($"Type [bold yellow]{Markup.Escape(project.MigrationProfile)}[/] to confirm:");
+		if (!string.Equals(confirmation, project.MigrationProfile, StringComparison.Ordinal))
+		{
+			AnsiConsole.MarkupLine("[yellow]Migration execution cancelled.[/]");
+			return;
+		}
+
+		using var request = CreateMigrationRequest(HttpMethod.Post, $"api/migrations/{Uri.EscapeDataString(project.MigrationProfile)}/apply", project, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+		using var response = await client.SendAsync(request);
+		await response.EnsureSuccessWithDetailsAsync();
+		var result = await response.Content.ReadFromJsonAsync<ApplyMigrationsResponse>()
+			?? throw new InvalidOperationException("The server returned an invalid migration result.");
+		if (result.AppliedMigrationIds.Count == 0)
+			AnsiConsole.MarkupLine("[green]No pending migrations remained.[/]");
+		else
+			AnsiConsole.MarkupLine($"[bold green]✓ Applied {result.AppliedMigrationIds.Count} migration(s) on the server.[/]");
+	}
+	catch (Exception exception)
+	{
+		AnsiConsole.MarkupLine($"[bold red]Migration Manager failed:[/] {Markup.Escape(exception.Message)}");
+	}
+}
+
+static async Task<MigrationStatusResponse> GetMigrationStatusAsync(HttpClient client, ProjectConfig project)
+{
+	using var request = CreateMigrationRequest(HttpMethod.Get, $"api/migrations/{Uri.EscapeDataString(project.MigrationProfile!)}", project, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+	using var response = await client.SendAsync(request);
+	await response.EnsureSuccessWithDetailsAsync();
+	return await response.Content.ReadFromJsonAsync<MigrationStatusResponse>()
+		?? throw new InvalidOperationException("The server returned an invalid migration status.");
+}
+
+static async Task<MigrationScriptUploadResponse> UploadMigrationScriptAsync(HttpClient client, ProjectConfig project, string scriptHash)
+{
+	await using var source = new FileStream(project.MigrationScriptPath!, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, FileOptions.Asynchronous | FileOptions.SequentialScan);
+	using var request = CreateMigrationRequest(HttpMethod.Put, $"api/migrations/{Uri.EscapeDataString(project.MigrationProfile!)}/script", project, scriptHash);
+	request.Content = new StreamContent(source);
+	request.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/sql");
+	request.Content.Headers.ContentLength = source.Length;
+	using var response = await client.SendAsync(request);
+	await response.EnsureSuccessWithDetailsAsync();
+	return await response.Content.ReadFromJsonAsync<MigrationScriptUploadResponse>()
+		?? throw new InvalidOperationException("The server returned an invalid migration upload result.");
+}
+
+static HttpRequestMessage CreateMigrationRequest(HttpMethod method, string route, ProjectConfig project, string bodySha256)
+{
+	var request = new HttpRequestMessage(method, route);
+	var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+	var nonce = Guid.NewGuid().ToString("D");
+	var canonical = string.Join("\n", timestamp, nonce, method.Method, "/" + route.TrimStart('/'), bodySha256);
+	using var hmac = new HMACSHA256(System.Text.Encoding.UTF8.GetBytes(project.MigrationExecutionKey!));
+	var signature = Convert.ToBase64String(hmac.ComputeHash(System.Text.Encoding.UTF8.GetBytes(canonical)));
+	request.Headers.Add("X-Migration-Key", project.MigrationExecutionKey!);
+	request.Headers.Add("X-Migration-Timestamp", timestamp);
+	request.Headers.Add("X-Migration-Nonce", nonce);
+	request.Headers.Add("X-Migration-Signature", signature);
+	request.Headers.Add("X-Migration-Content-Sha256", bodySha256);
+	return request;
+}
+
+static void RenderMigrationStatus(MigrationStatusResponse status)
+{
+	var table = new Table().Border(TableBorder.Rounded).Title($"[cyan]Migration profile: {Markup.Escape(status.ProfileName)}[/]");
+	table.AddColumn("Migration ID");
+	table.AddColumn("Status");
+	foreach (var migration in status.Migrations)
+		table.AddRow(Markup.Escape(migration.MigrationId), migration.IsApplied ? "[green]Applied[/]" : "[yellow]Pending[/]");
+	AnsiConsole.Write(table);
 }
 
 static Dictionary<string, string> GetLocalFileHashes(string basePath, List<string> ignoredPaths)
@@ -890,10 +1002,10 @@ static async Task ManualExecuteLocalCommandsAsync(List<LocalCommandConfig> comma
 
 static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string? syncManifestId, string version, string zipPath, Action<string> uploadStatus, Action<int, string> uploadProgress)
 {
-	const int chunkSize = 8 * 1024 * 1024;
+	const int chunkSize = 512 * 1024;
 	var totalBytes = new FileInfo(zipPath).Length;
 	var fileHash = await ComputeFileHashAsync(zipPath);
-	var manifestPath = GetPendingUploadManifestPath(project, version, fileHash);
+	var manifestPath = GetPendingUploadManifestPath(project, version, fileHash, chunkSize);
 	var uploadZipPath = zipPath;
 	PendingUploadManifest? manifest = await LoadPendingUploadManifestAsync(manifestPath);
 	UploadSessionResponse? session = null;
@@ -922,6 +1034,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 
 		using var sessionResponse = await client.PostAsJsonAsync("api/upload/sessions", new CreateUploadSessionRequest(
 			project.Name, version, project.EnableRollback, project.MirrorServerToLocal, [], [], syncManifestId, totalBytes, chunkSize, fileHash));
+		LogUploadDiagnostic($"Session create response. Project={project.Name}; TotalBytes={totalBytes}; ChunkSize={chunkSize}; Status={(int)sessionResponse.StatusCode} {sessionResponse.StatusCode}");
 		await sessionResponse.EnsureSuccessWithDetailsAsync();
 		session = await sessionResponse.Content.ReadFromJsonAsync<UploadSessionResponse>()
 			?? throw new InvalidOperationException("The server did not return an upload session.");
@@ -940,6 +1053,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 	}
 
 	using var statusResponse = await client.GetAsync($"api/upload/sessions/{session.UploadId}");
+	LogUploadDiagnostic($"Session status response. UploadId={session.UploadId}; Status={(int)statusResponse.StatusCode} {statusResponse.StatusCode}");
 	await statusResponse.EnsureSuccessWithDetailsAsync();
 	var status = await statusResponse.Content.ReadFromJsonAsync<UploadSessionStatusResponse>()
 		?? throw new InvalidOperationException("The server did not return upload status.");
@@ -993,12 +1107,18 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 				}));
 				content.Headers.ContentLength = length;
 
-				using var request = new HttpRequestMessage(HttpMethod.Put, $"api/upload/sessions/{session.UploadId}/chunks/{chunkIndex}")
+				using var request = new HttpRequestMessage(HttpMethod.Post, $"api/upload/sessions/{session.UploadId}/chunks/{chunkIndex}")
 				{
 					Content = content
 				};
+				var requestId = Guid.NewGuid().ToString("N");
+				request.Headers.TryAddWithoutValidation("X-Request-Id", requestId);
+				LogUploadDiagnostic($"Chunk sending. RequestId={requestId}; UploadId={session.UploadId}; ChunkIndex={chunkIndex}; Offset={offset}; Length={length}; Attempt={attempt}");
 				using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
-				await response.EnsureSuccessWithDetailsAsync();
+				var responseBody = await response.Content.ReadAsStringAsync();
+				LogUploadDiagnostic($"Chunk response. RequestId={requestId}; UploadId={session.UploadId}; ChunkIndex={chunkIndex}; Attempt={attempt}; Status={(int)response.StatusCode} {response.StatusCode}; Headers={FormatDiagnosticResponseHeaders(response)}; Body={TruncateUploadDiagnostic(responseBody)}");
+				if (!response.IsSuccessStatusCode)
+					throw new Exception($"HTTP {(int)response.StatusCode}: {responseBody}");
 				sent = true;
 				completedBytes += length;
 				completedChunks.Add(chunkIndex);
@@ -1006,7 +1126,8 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 			}
 			catch (Exception ex) when (attempt < 5)
 			{
-				uploadStatus($"Chunk {chunkIndex + 1} failed; retrying ({attempt}/4)...");
+				LogUploadDiagnostic($"Chunk failed. UploadId={session.UploadId}; ChunkIndex={chunkIndex}; Attempt={attempt}; ExceptionType={ex.GetType().Name}; Message={TruncateUploadDiagnostic(ex.ToString())}");
+				uploadStatus($"Chunk {chunkIndex + 1} failed: {Markup.Escape(ex.Message)}; retrying ({attempt}/4)...");
 				await Task.Delay(TimeSpan.FromSeconds(Math.Min(30, Math.Pow(2, attempt))), CancellationToken.None);
 				if (ex is OperationCanceledException)
 					throw;
@@ -1019,15 +1140,44 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 
 	uploadStatus("[yellow]Upload complete. Verifying and deploying on server...[/]");
 	using var completeResponse = await client.PostAsync($"api/upload/sessions/{session.UploadId}/complete", content: null);
+	LogUploadDiagnostic($"Upload complete response. UploadId={session.UploadId}; Status={(int)completeResponse.StatusCode} {completeResponse.StatusCode}; Body={TruncateUploadDiagnostic(await completeResponse.Content.ReadAsStringAsync())}");
 	await completeResponse.EnsureSuccessWithDetailsAsync();
 	await DeletePendingUploadManifestAsync(manifestPath);
 	if (!string.Equals(uploadZipPath, zipPath, StringComparison.OrdinalIgnoreCase) && File.Exists(uploadZipPath))
 		File.Delete(uploadZipPath);
 }
 
-static string GetPendingUploadManifestPath(ProjectConfig project, string version, string fileHash)
+static void LogUploadDiagnostic(string message)
 {
-	var key = $"{project.Name}|{version}|{project.EnableRollback}|{fileHash}";
+	try
+	{
+		var path = Path.Combine(Path.GetTempPath(), "FastCICD-Upload.log");
+		File.AppendAllText(path, $"{DateTimeOffset.UtcNow:O} {message}{Environment.NewLine}");
+	}
+	catch
+	{
+		// Diagnostic logging must never change deployment behavior.
+	}
+}
+
+static string TruncateUploadDiagnostic(string value)
+{
+	const int maxLength = 2000;
+	return value.Length <= maxLength ? value : value[..maxLength] + "...";
+}
+
+static string FormatDiagnosticResponseHeaders(HttpResponseMessage response)
+{
+	var headers = response.Headers
+		.Concat(response.Content.Headers)
+		.Where(header => !header.Key.Equals("Set-Cookie", StringComparison.OrdinalIgnoreCase))
+		.Select(header => $"{header.Key}={string.Join(",", header.Value)}");
+	return string.Join(" | ", headers);
+}
+
+static string GetPendingUploadManifestPath(ProjectConfig project, string version, string fileHash, int chunkSize)
+{
+	var key = $"{project.Name}|{version}|{project.EnableRollback}|{chunkSize}|{fileHash}";
 	var keyHash = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(key))).ToLowerInvariant();
 	var directory = Path.Combine(Path.GetTempPath(), "FastCICD-ClientUploadSessions");
 	Directory.CreateDirectory(directory);
@@ -1081,21 +1231,36 @@ static async Task<string> ComputeFileHashAsync(string path)
 sealed class DeploymentDashboard
 {
 	private static readonly string[] SpinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+	// Rows a Panel/Table adds beyond its own content, based on Spectre's Rounded border:
+	//   Panel  -> top border+header line, ...content..., bottom border
+	//   Table  -> top border, header row, header/body separator, ...data rows..., bottom border
+	private const int PanelChromeRows = 2;
+	private const int TableChromeRows = 4;
+	private const int StageContentRows = 1;
+	private const int UploadContentRows = 2;
+	private const int TerminalHeightSafetyMargin = 2; // leaves room for the shell prompt line, avoids edge-of-buffer clipping
+	private const int MinUsableHeight = 6;
+	private const int MaxCommandOutputLines = 12;
+
 	private readonly List<string> commandOutput = [];
 	private string stage = "[grey]Initializing deployment pipeline...[/]";
 	private string? uploadDetails;
-	private Table? deltaFiles;
 	private int uploadPercent;
 	private int spinnerFrame;
+
+	// Raw rows for the delta-file table. Kept as data (not a pre-built Table) so
+	// Render() can decide, every frame, how many rows actually fit on screen.
+	private List<(string Directory, string FileName)> deltaFileRows = [];
 
 	public void SetStage(string value)
 	{
 		stage = value;
 	}
 
-	public void SetDeltaFiles(Table value)
+	public void SetDeltaFiles(List<(string Directory, string FileName)> rows)
 	{
-		deltaFiles = value;
+		deltaFileRows = rows;
 	}
 
 	public void SetUploadProgress(int percent, string details)
@@ -1108,7 +1273,7 @@ sealed class DeploymentDashboard
 	public void AddCommandOutput(string line)
 	{
 		commandOutput.Add(line);
-		while (commandOutput.Count > 12)
+		while (commandOutput.Count > MaxCommandOutputLines)
 			commandOutput.RemoveAt(0);
 	}
 
@@ -1122,35 +1287,108 @@ sealed class DeploymentDashboard
 		if (advanceSpinner)
 			spinnerFrame = (spinnerFrame + 1) % SpinnerFrames.Length;
 
+		// The "Deployment status" panel is always shown and always exactly
+		// StageContentRows + PanelChromeRows tall, so it is guaranteed visible.
 		var content = new List<IRenderable>
 		{
 			new Panel(new Markup($"[magenta]{SpinnerFrames[spinnerFrame]}[/] {stage}"))
 				.Header("[bold cyan]Deployment status[/]")
 				.Border(BoxBorder.Rounded)
 		};
+		var usedRows = StageContentRows + PanelChromeRows;
 
 		if (uploadDetails != null)
 		{
 			const int width = 36;
-			var filled = (int)Math.Round(width * (uploadPercent / 100d));
+			var filled = (int) Math.Round(width * (uploadPercent / 100d));
 			var bar = new string('█', filled) + new string('░', width - filled);
 			content.Add(new Panel(new Rows(
-				new Markup($"[green]{bar}[/] [bold yellow]{uploadPercent}%[/]"),
-				new Markup($"[grey]{uploadDetails}[/]")))
+					new Markup($"[green]{bar}[/] [bold yellow]{uploadPercent}%[/]"),
+					new Markup($"[grey]{uploadDetails}[/]")))
 				.Header("[bold cyan]Upload progress[/]")
 				.Border(BoxBorder.Rounded));
+			usedRows += UploadContentRows + PanelChromeRows;
 		}
 
-		if (deltaFiles != null)
-			content.Add(deltaFiles);
+		// Everything below this point is "nice to have" detail (file list, command
+		// log). We size it to whatever vertical space is left in the *real* terminal
+		// window so the total render never exceeds the visible area - no more manual
+		// resizing/maximizing needed to see the status and upload panels above.
+		var availableRows = Math.Max(MinUsableHeight, GetTerminalHeight() - TerminalHeightSafetyMargin);
+		var remainingRows = Math.Max(0, availableRows - usedRows);
 
-		if (commandOutput.Count != 0)
+		var wantsTable = deltaFileRows.Count > 0;
+		var wantsLog = commandOutput.Count > 0;
+
+		var tableDataRows = 0;
+		var logLines = 0;
+
+		if (wantsTable && wantsLog)
 		{
-			content.Add(new Panel(new Rows(commandOutput.Select(line => new Markup(line))))
+			var forData = Math.Max(0, remainingRows - TableChromeRows - PanelChromeRows);
+			// The file list is the more important of the two "detail" panels, so it
+			// gets the bigger share; the command log still gets a fair minimum.
+			tableDataRows = (int) Math.Round(forData * 0.65);
+			logLines = forData - tableDataRows;
+		}
+		else if (wantsTable)
+		{
+			tableDataRows = Math.Max(0, remainingRows - TableChromeRows);
+		}
+		else if (wantsLog)
+		{
+			logLines = Math.Max(0, remainingRows - PanelChromeRows);
+		}
+
+		if (wantsTable && tableDataRows > 0)
+		{
+			var table = new Table()
+				.Border(TableBorder.Rounded)
+				.BorderColor(Color.Grey)
+				.AddColumn(new TableColumn("[cyan]Directory[/]"))
+				.AddColumn(new TableColumn("[green]File Name[/]"));
+
+			var totalFiles = deltaFileRows.Count;
+			var needsSummaryRow = totalFiles > tableDataRows;
+			var rowBudget = needsSummaryRow ? Math.Max(1, tableDataRows - 1) : tableDataRows;
+
+			foreach (var (dir, name) in deltaFileRows.Take(rowBudget))
+				table.AddRow(dir, name);
+
+			if (needsSummaryRow)
+			{
+				var hidden = totalFiles - Math.Min(rowBudget, deltaFileRows.Count);
+				table.AddRow("[grey]...[/]", $"[grey]... and {hidden} more file(s) not shown ({totalFiles} total; all of them still upload).[/]");
+			}
+
+			content.Add(table);
+		}
+
+		if (wantsLog && logLines > 0)
+		{
+			var visibleLines = commandOutput.TakeLast(logLines);
+			content.Add(new Panel(new Rows(visibleLines.Select(line => new Markup(line))))
 				.Header("[bold magenta]Live local command output[/]")
 				.Border(BoxBorder.Rounded));
 		}
 
 		return new Rows(content);
+	}
+
+	private static int GetTerminalHeight()
+	{
+		try
+		{
+			var height = Console.WindowHeight;
+			if (height > 0)
+				return height;
+		}
+		catch
+		{
+			// Console.WindowHeight throws when output is redirected/not a real console;
+			// fall through to the profile-based fallback below.
+		}
+
+		return AnsiConsole.Profile.Height > 0 ? AnsiConsole.Profile.Height : 40;
 	}
 }

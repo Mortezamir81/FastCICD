@@ -8,6 +8,9 @@ public class ProjectConfig
 	public bool EnableRollback { get; set; } = true;
 	public bool MirrorServerToLocal { get; set; } = false;
 	public bool AlwaysRunPostDeployCommands { get; set; } = false;
+	public string? MigrationProfile { get; set; }
+	public string? MigrationExecutionKey { get; set; }
+	public string? MigrationScriptPath { get; set; }
 	public List<string> ServicesToManage { get; set; } = [];
 	public List<string> IgnoredFiles { get; set; } = [];
 

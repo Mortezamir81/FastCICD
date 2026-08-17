@@ -35,6 +35,7 @@ public class HmacDelegatingHandler : DelegatingHandler
 		// Inject signature headers into the request
 		request.Headers.Add("X-Timestamp", timestamp);
 		request.Headers.Add("X-Signature", signature);
+		request.Headers.TryAddWithoutValidation("X-Request-Id", Guid.NewGuid().ToString("N"));
 
 		return await base.SendAsync(request, cancellationToken);
 	}
