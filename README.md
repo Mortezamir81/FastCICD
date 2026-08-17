@@ -114,6 +114,8 @@ On your local machine (or build server), place the following `appsettings.json` 
 * `PreDeployCommands` / `PostDeployCommands`: CLI commands to execute on the server.
 * `MigrationProfile` / `MigrationExecutionKey`: Enables the Migration Manager for this project. This is deliberately separate from the normal deployment key.
 
+`DeployerSettings:UploadChunkSizeBytes` is configured in the client clone, not on the server. This lets each clone choose its own chunk size for its configured `ServerEndpoint` (for example, `8388608` for 8 MB).
+
 ### Server-side database migrations
 
 Create an idempotent EF Core SQL script locally (for example, `dotnet ef migrations script --idempotent --output database/migrations.sql`). Set its local path in the client project configuration. FastCICD securely uploads it to the API's dedicated migration storage directory; configure only the database connection string in the server's `appsettings.json` under `MigrationProfiles`. Do not put a connection string in the client configuration.
@@ -144,7 +146,7 @@ Once configured, simply run the FastCICD Client console application. You will be
 * **Never share your `SecurityKey`.** It acts as the master password between your client and server.
 * The HMAC signature generates a unique cryptographic hash for every request based on the current time. This completely prevents **Replay Attacks**. If a request is intercepted, it will naturally expire in 5 minutes and cannot be reused.
 * Upload requests use the server's `UploadHmacValidityMinutes` setting (120 minutes in the example configuration) because reverse proxies may buffer large multipart requests before forwarding them. Keep client and server clocks synchronized.
-* Deployments use resumable 8 MB chunks. A failed chunk is retried independently, and the server keeps the upload session and partial file until completion or cleanup.
+* Deployments use resumable chunks whose size is configured by the client clone through `DeployerSettings:UploadChunkSizeBytes`. A failed chunk is retried independently, and the server keeps the upload session and partial file until completion or cleanup.
 * The client stores a local resume manifest keyed by project, version, backup mode, and ZIP SHA-256. Re-running with the same artifact resumes the previous session; changed files or a changed version intentionally create a new deployment session.
 
 ---

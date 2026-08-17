@@ -494,7 +494,6 @@ public static class DeployEndpoints
 			var requestId = GetRequestId(httpRequest);
 			var allowedDirs = config.GetSection("AllowedDirectories").Get<Dictionary<string, string>>();
 			var maxUploadBytes = config.GetValue<long?>("MaxUploadBytes") ?? 10L * 1024 * 1024 * 1024;
-			var maxChunkSize = config.GetValue<int?>("UploadChunkSizeBytes") ?? 8 * 1024 * 1024;
 
 			if (allowedDirs == null || !allowedDirs.ContainsKey(request.ProjectName))
 			{
@@ -516,8 +515,13 @@ public static class DeployEndpoints
 				logger.LogWarning("Upload session rejected. RequestId: {RequestId}; Reason: Invalid file hash length; Project: {ProjectName}; HashLength: {HashLength}", requestId, request.ProjectName, request.FileHash?.Length ?? 0);
 				return Results.BadRequest("A SHA-256 file hash is required.");
 			}
+			if (GetTotalChunks(request.TotalBytes, request.ChunkSize) > int.MaxValue)
+			{
+				logger.LogWarning("Upload session rejected. RequestId: {RequestId}; Reason: Too many chunks; Project: {ProjectName}; TotalBytes: {TotalBytes}; ChunkSize: {ChunkSize}", requestId, request.ProjectName, request.TotalBytes, request.ChunkSize);
+				return Results.BadRequest("The requested chunk size produces too many chunks.");
+			}
 
-			var normalizedRequest = request with { ChunkSize = Math.Min(request.ChunkSize, maxChunkSize) };
+			var normalizedRequest = request;
 			if (request.MirrorServerToLocal)
 			{
 				if (string.IsNullOrWhiteSpace(request.SyncManifestId))
@@ -682,7 +686,10 @@ public static class DeployEndpoints
 	}
 
 	private static int GetTotalChunks(UploadSessionMetadata metadata)
-		=> checked((int)((metadata.TotalBytes + metadata.ChunkSize - 1) / metadata.ChunkSize));
+		=> checked((int)GetTotalChunks(metadata.TotalBytes, metadata.ChunkSize));
+
+	private static long GetTotalChunks(long totalBytes, int chunkSize)
+		=> (totalBytes + chunkSize - 1) / chunkSize;
 
 	private static long GetChunkLength(UploadSessionMetadata metadata, int chunkIndex)
 	{
