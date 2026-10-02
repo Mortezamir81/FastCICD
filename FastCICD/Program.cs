@@ -492,17 +492,6 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 				var localFiles = GetLocalFileHashes(project.LocalSourcePath, project.IgnoredFiles);
 				status($"[grey]Found {localFiles.Count} files locally.[/]");
 
-				if (project.ServicesToManage.Count != 0)
-				{
-					status("[red]Stopping Windows Services on remote server...[/]");
-					var stopRes = await httpClient.PostAsJsonAsync("api/services",
-						new { Services = project.ServicesToManage, Action = "stop" });
-					await stopRes.EnsureSuccessWithDetailsAsync();
-
-					servicesWereStopped = true;
-					status("[grey]Services stopped successfully.[/]");
-				}
-
 				status("[blue]Comparing with server state...[/]");
 
 				var response = await httpClient.PostAsJsonAsync("api/compare",
@@ -542,6 +531,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 				}
 				status($"[grey]Preparing {deltaFiles.Count} changed files for upload...[/]");
 
+				// The site keeps running during the (slow) upload; services are stopped only right before the server extracts the files.
 				await UploadDeltaZipAsync(httpClient, project, deltaFiles, compareResult?.SyncManifestId, version, uploadChunkSizeBytes, status, (percent, text) =>
 				{
 					lock (renderLock)
@@ -549,6 +539,18 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 						dashboard.SetUploadProgress(percent, text);
 						live.UpdateTarget(dashboard.Render());
 					}
+				}, async () =>
+				{
+					if (project.ServicesToManage.Count == 0)
+						return;
+
+					status("[red]Stopping Windows Services on remote server...[/]");
+					// Mark first so the safety net restarts services even if only some of them stopped.
+					servicesWereStopped = true;
+					var stopRes = await httpClient.PostAsJsonAsync("api/services",
+						new { Services = project.ServicesToManage, Action = "stop" });
+					await stopRes.EnsureSuccessWithDetailsAsync();
+					status("[grey]Services stopped successfully.[/]");
 				});
 				status("[grey]Files uploaded and extracted successfully.[/]");
 
@@ -791,7 +793,7 @@ static Dictionary<string, string> GetLocalFileHashes(string basePath, List<strin
 	return hashes.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
 }
 
-static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, List<string> deltaFiles, string? syncManifestId, string version, int uploadChunkSizeBytes, Action<string> status, Action<int, string> uploadProgress)
+static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, List<string> deltaFiles, string? syncManifestId, string version, int uploadChunkSizeBytes, Action<string> status, Action<int, string> uploadProgress, Func<Task> beforeComplete)
 {
 	var tempDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
 	var zipPath = tempDir + ".zip";
@@ -818,7 +820,7 @@ static async Task UploadDeltaZipAsync(HttpClient client, ProjectConfig project, 
 
 		try
 		{
-			await UploadResumableAsync(client, project, syncManifestId, version, zipPath, uploadChunkSizeBytes, status, uploadProgress);
+			await UploadResumableAsync(client, project, syncManifestId, version, zipPath, uploadChunkSizeBytes, status, uploadProgress, beforeComplete);
 		}
 		catch
 		{
@@ -999,7 +1001,7 @@ static async Task ManualExecuteLocalCommandsAsync(List<LocalCommandConfig> comma
 	}
 }
 
-static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string? syncManifestId, string version, string zipPath, int chunkSize, Action<string> uploadStatus, Action<int, string> uploadProgress)
+static async Task UploadResumableAsync(HttpClient client, ProjectConfig project, string? syncManifestId, string version, string zipPath, int chunkSize, Action<string> uploadStatus, Action<int, string> uploadProgress, Func<Task> beforeComplete)
 {
 	var totalBytes = new FileInfo(zipPath).Length;
 	var fileHash = await ComputeFileHashAsync(zipPath);
@@ -1138,6 +1140,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 			throw new IOException($"Chunk {chunkIndex + 1} could not be uploaded after 5 attempts.");
 	}
 
+	await beforeComplete();
 	uploadStatus("[yellow]Upload complete. Verifying and deploying on server...[/]");
 	using var completeResponse = await client.PostAsync($"api/upload/sessions/{session.UploadId}/complete", content: null);
 	LogUploadDiagnostic($"Upload complete response. UploadId={session.UploadId}; Status={(int)completeResponse.StatusCode} {completeResponse.StatusCode}; Body={TruncateUploadDiagnostic(await completeResponse.Content.ReadAsStringAsync())}");
