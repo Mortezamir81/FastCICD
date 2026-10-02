@@ -7,27 +7,14 @@ using System.Security.Cryptography;
 using System.ServiceProcess;
 using System.Text.Json;
 using CICD_API.Uploads;
+using FastCICD.Shared;
 
 namespace CICD_API.Endpoints;
 
 public static class DeployEndpoints
 {
-	// Must stay identical to the client's ignore matching (FastCICD/Program.cs), otherwise mirror sync
-	// would delete server files that the client deliberately ignored.
 	private static bool IsIgnoredPath(string path, IEnumerable<string> ignoredFiles)
-	{
-		var normalizedPath = path.Replace('/', '\\');
-		return ignoredFiles.Any(ignored =>
-		{
-			var normalizedIgnored = ignored.Replace('/', '\\').Trim('\\');
-			if (normalizedIgnored.Length == 0)
-				return false;
-			return normalizedPath.Equals(normalizedIgnored, StringComparison.OrdinalIgnoreCase) ||
-				normalizedPath.StartsWith(normalizedIgnored + "\\", StringComparison.OrdinalIgnoreCase) ||
-				normalizedPath.Contains("\\" + normalizedIgnored + "\\", StringComparison.OrdinalIgnoreCase) ||
-				normalizedPath.EndsWith("\\" + normalizedIgnored, StringComparison.OrdinalIgnoreCase);
-		});
-	}
+		=> IgnoreMatcher.IsIgnored(path, ignoredFiles);
 
 	private static bool IsDefinedProject(IConfiguration config, string? projectName)
 		=> !string.IsNullOrWhiteSpace(projectName) &&

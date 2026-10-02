@@ -7,6 +7,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using FastCICD;
 using FastCICD.Models;
+using FastCICD.Shared;
 using Microsoft.Extensions.Configuration;
 using Spectre.Console;
 using Spectre.Console.Rendering;
@@ -770,18 +771,7 @@ static Dictionary<string, string> GetLocalFileHashes(string basePath, List<strin
 		var relativePath = Path.GetRelativePath(basePath, file);
 		var normalizedRelativePath = relativePath.Replace('/', '\\');
 
-		bool isIgnored = ignoredPaths.Any(ignored =>
-		{
-			// Trim both ends so "logs/" and "\logs" behave like "logs".
-			var normalizedIgnored = ignored.Replace('/', '\\').Trim('\\');
-			if (normalizedIgnored.Length == 0)
-				return false;
-
-			return normalizedRelativePath.Equals(normalizedIgnored, StringComparison.OrdinalIgnoreCase) ||
-							   normalizedRelativePath.StartsWith(normalizedIgnored + "\\", StringComparison.OrdinalIgnoreCase) ||
-							   normalizedRelativePath.Contains("\\" + normalizedIgnored + "\\", StringComparison.OrdinalIgnoreCase) ||
-							   normalizedRelativePath.EndsWith("\\" + normalizedIgnored, StringComparison.OrdinalIgnoreCase);
-		});
+		bool isIgnored = IgnoreMatcher.IsIgnored(normalizedRelativePath, ignoredPaths);
 
 		if (isIgnored)
 			return;

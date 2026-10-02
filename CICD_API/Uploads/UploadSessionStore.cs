@@ -22,7 +22,8 @@ public static class UploadSessionStore
 	private static readonly ConcurrentDictionary<string, UploadSession> Sessions = new();
 	private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
-	public static string RootDirectory { get; } = Path.Combine(Path.GetTempPath(), "FastCICD-UploadSessions");
+	/// <summary>Folder that holds upload sessions. Defaults to a folder in the system temp path; set UploadSessionDirectory to change it.</summary>
+	public static string RootDirectory { get; set; } = Path.Combine(Path.GetTempPath(), "FastCICD-UploadSessions");
 
 	/// <summary>How long a session may stay inactive (no chunk received) before it is discarded.</summary>
 	public static TimeSpan Retention { get; set; } = TimeSpan.FromHours(24);

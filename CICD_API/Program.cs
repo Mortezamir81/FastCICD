@@ -39,6 +39,10 @@ var app = builder.Build();
 
 app.UseForwardedHeaders();
 
+var configuredUploadSessionDirectory = app.Configuration["UploadSessionDirectory"];
+if (!string.IsNullOrWhiteSpace(configuredUploadSessionDirectory))
+	UploadSessionStore.RootDirectory = configuredUploadSessionDirectory;
+
 if ((app.Configuration["SecurityKey"]?.Length ?? 0) < 32)
 	app.Logger.LogWarning("SecurityKey is missing or shorter than 32 characters. Use a long random key.");
 if (!string.IsNullOrWhiteSpace(app.Configuration["AllowedClientIp"]))
@@ -108,3 +112,5 @@ app.MapDeployEndpoints();
 app.MapMigrationEndpoints();
 
 app.Run();
+
+public partial class Program;

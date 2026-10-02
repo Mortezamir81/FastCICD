@@ -5,6 +5,9 @@
   <Folder Name="/Server/">
     <Project Path="CICD_API/CICD_API.csproj" />
   </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="tests/FastCICD.Tests/FastCICD.Tests.csproj" />
+  </Folder>
   <Folder Name="/Solution Items/">
     <File Path="LICENSE" />
     <File Path="README.md" />

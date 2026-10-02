@@ -19,4 +19,8 @@
     </None>
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Include="..\Shared\IgnoreMatcher.cs" Link="Shared\IgnoreMatcher.cs" />
+  </ItemGroup>
+
 </Project>
