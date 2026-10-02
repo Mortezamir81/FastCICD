@@ -23,6 +23,10 @@ public static class DeployEndpoints
 		});
 	}
 
+	private static bool IsDefinedProject(IConfiguration config, string? projectName)
+		=> !string.IsNullOrWhiteSpace(projectName) &&
+		   config.GetSection("AllowedDirectories").Get<Dictionary<string, string>>()?.ContainsKey(projectName) == true;
+
 	private static string GetMetadataPath(string backupDirBase, string projectName)
 		=> Path.Combine(backupDirBase, projectName, "project_metadata.json");
 
@@ -107,6 +111,9 @@ public static class DeployEndpoints
 		{
 			logger.LogInformation("Executing '{Action}' action on {Count} services.", request.Action, request.Services.Count);
 
+			if (request.Action is not ("status" or "start" or "stop"))
+				return Results.BadRequest($"Unknown action '{request.Action}'. Use status, start, or stop.");
+
 			var allowedServices = config.GetSection("AllowedServices").Get<List<string>>() ?? [];
 			var statuses = new Dictionary<string, string>();
 
@@ -160,14 +167,16 @@ public static class DeployEndpoints
 				}
 				catch (Exception ex)
 				{
-					// Log the error but CONTINUE the loop instead of aborting the entire request
 					logger.LogError(ex, "Failed to manage service '{ServiceName}'. Error: {Message}", serviceName, ex.Message);
 
 					if (request.Action == "status")
 					{
 						statuses.Add(serviceName, "Error");
+						continue;
 					}
-					continue;
+
+					// A failed start/stop must not be reported as success, or the deploy would run over live files.
+					return Results.Problem($"Could not {request.Action} service '{serviceName}': {ex.Message}");
 				}
 			}
 
@@ -178,6 +187,9 @@ public static class DeployEndpoints
 		// Get available backups for a project
 		app.MapGet("/api/backups", ([FromQuery] string projectName, IConfiguration config, ILogger<Program> logger) =>
 		{
+			if (!IsDefinedProject(config, projectName))
+				return Results.BadRequest("Project not defined.");
+
 			var backupDirBase = config["BackupDirectory"];
 			if (string.IsNullOrEmpty(backupDirBase))
 			{
@@ -215,6 +227,18 @@ public static class DeployEndpoints
 				return Results.BadRequest("Project not defined.");
 			}
 
+			if (string.IsNullOrEmpty(backupDirBase))
+				return Results.BadRequest("BackupDirectory is not configured on the server.");
+
+			// Only a plain .zip file name inside the project's backup folder is accepted.
+			if (string.IsNullOrWhiteSpace(request.BackupFileName) ||
+				request.BackupFileName != Path.GetFileName(request.BackupFileName) ||
+				!request.BackupFileName.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+			{
+				logger.LogWarning("Rollback rejected: invalid backup file name '{BackupFileName}'.", request.BackupFileName);
+				return Results.BadRequest("Invalid backup file name.");
+			}
+
 			var projectBackupDir = Path.Combine(backupDirBase, request.ProjectName);
 			var backupFilePath = Path.Combine(projectBackupDir, request.BackupFileName);
 
@@ -243,6 +267,9 @@ public static class DeployEndpoints
 		// Get current version of a project
 		app.MapGet("/api/version", async ([FromQuery] string projectName, IConfiguration config, ILogger<Program> logger) =>
 		{
+			if (!IsDefinedProject(config, projectName))
+				return Results.BadRequest("Project not defined.");
+
 			var backupDirBase = config["BackupDirectory"];
 
 			// Prevent ArgumentNullException if BackupDirectory is missing in appsettings

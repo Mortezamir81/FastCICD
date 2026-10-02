@@ -257,7 +257,7 @@ static async Task ShowCurrentVersionAsync(HttpClient client, string projectName)
 {
 	try
 	{
-		var res = await client.GetAsync($"api/version?projectName={projectName}");
+		var res = await client.GetAsync($"api/version?projectName={Uri.EscapeDataString(projectName)}");
 		await res.EnsureSuccessWithDetailsAsync();
 
 		var data = await res.Content.ReadFromJsonAsync<VersionResponse>();
@@ -336,7 +336,7 @@ static async Task HandleRollbackAsync(HttpClient client, ProjectConfig project)
 {
 	try
 	{
-		var res = await client.GetAsync($"api/backups?projectName={project.Name}");
+		var res = await client.GetAsync($"api/backups?projectName={Uri.EscapeDataString(project.Name)}");
 		await res.EnsureSuccessWithDetailsAsync();
 
 		var backups = await res.Content.ReadFromJsonAsync<List<string>>();
@@ -368,7 +368,8 @@ static async Task HandleRollbackAsync(HttpClient client, ProjectConfig project)
 			if (project.ServicesToManage.Count != 0)
 			{
 				ctx.Status("[red]Stopping Services...[/]");
-				await client.PostAsJsonAsync("api/services", new { Services = project.ServicesToManage, Action = "stop" });
+				var stopRes = await client.PostAsJsonAsync("api/services", new { Services = project.ServicesToManage, Action = "stop" });
+				await stopRes.EnsureSuccessWithDetailsAsync();
 			}
 
 			ctx.Status("[blue]Restoring Backup Files...[/]");
@@ -378,7 +379,8 @@ static async Task HandleRollbackAsync(HttpClient client, ProjectConfig project)
 			if (project.ServicesToManage.Count != 0)
 			{
 				ctx.Status("[green]Restarting Services...[/]");
-				await client.PostAsJsonAsync("api/services", new { Services = project.ServicesToManage, Action = "start" });
+				var startRes = await client.PostAsJsonAsync("api/services", new { Services = project.ServicesToManage, Action = "start" });
+				await startRes.EnsureSuccessWithDetailsAsync();
 			}
 
 			AnsiConsole.WriteLine();
@@ -402,7 +404,7 @@ static async Task ExecuteDeploymentPipelineAsync(HttpClient httpClient, ProjectC
 		string currentVersion = "Unknown";
 		try
 		{
-			var versionRes = await httpClient.GetAsync($"api/version?projectName={project.Name}");
+			var versionRes = await httpClient.GetAsync($"api/version?projectName={Uri.EscapeDataString(project.Name)}");
 			if (versionRes.IsSuccessStatusCode)
 			{
 				var data = await versionRes.Content.ReadFromJsonAsync<VersionResponse>();
