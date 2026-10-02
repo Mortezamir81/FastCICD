@@ -1,6 +1,7 @@
 using CICD_API.Endpoints;
 using CICD_API.Middlewares;
 using CICD_API.Migrations;
+using CICD_API.Uploads;
 using Microsoft.AspNetCore.HttpOverrides;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -31,6 +32,7 @@ string uploadDiagnosticsLogPath = string.IsNullOrWhiteSpace(configuredUploadDiag
 var uploadDiagnosticsLogLock = new object();
 
 builder.Services.AddSingleton<IMigrationManager, MigrationManager>();
+builder.Services.AddHostedService<UploadSessionCleanupService>();
 builder.Services.AddSingleton<MigrationRequestAuthenticator>();
 
 var app = builder.Build();

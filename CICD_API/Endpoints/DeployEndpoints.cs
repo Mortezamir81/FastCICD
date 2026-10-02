@@ -447,6 +447,20 @@ public static class DeployEndpoints
 				return Results.BadRequest("The requested chunk size produces too many chunks.");
 			}
 
+			// Protect the server disk: each session pre-allocates its full size.
+			var maxActiveSessions = config.GetValue<int?>("MaxActiveUploadSessions") ?? 20;
+			if (UploadSessionStore.CountActive() >= maxActiveSessions)
+			{
+				logger.LogWarning("Upload session rejected. RequestId: {RequestId}; Reason: Too many pending sessions; Limit: {Limit}", requestId, maxActiveSessions);
+				return Results.Problem($"Too many pending upload sessions (limit {maxActiveSessions}). Finish or wait for old uploads to expire.", statusCode: StatusCodes.Status429TooManyRequests);
+			}
+			const long freeSpaceMargin = 256L * 1024 * 1024;
+			if (UploadSessionStore.GetFreeBytes() < request.TotalBytes + freeSpaceMargin)
+			{
+				logger.LogWarning("Upload session rejected. RequestId: {RequestId}; Reason: Not enough free disk space; TotalBytes: {TotalBytes}", requestId, request.TotalBytes);
+				return Results.Problem("The server does not have enough free disk space for this upload.", statusCode: StatusCodes.Status507InsufficientStorage);
+			}
+
 			var normalizedRequest = request;
 			if (request.MirrorServerToLocal)
 			{
@@ -602,6 +616,7 @@ public static class DeployEndpoints
 
 			try
 			{
+				var integrityFailed = false;
 				await using (var stream = new FileStream(session.PartFilePath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
 				{
 					using var sha256 = SHA256.Create();
@@ -609,8 +624,15 @@ public static class DeployEndpoints
 					if (!actualHash.Equals(session.Metadata.FileHash, StringComparison.OrdinalIgnoreCase))
 					{
 						logger.LogWarning("Upload integrity check failed. RequestId: {RequestId}; UploadId: {UploadId}; ExpectedHashPrefix: {ExpectedHashPrefix}; ActualHashPrefix: {ActualHashPrefix}", requestId, uploadId, session.Metadata.FileHash[..Math.Min(12, session.Metadata.FileHash.Length)], actualHash[..12]);
-						return Results.Problem("Upload integrity verification failed.", statusCode: StatusCodes.Status422UnprocessableEntity);
+						integrityFailed = true;
 					}
+				}
+
+				if (integrityFailed)
+				{
+					// A corrupt session can never succeed; dropping it lets the client start a fresh one instead of resuming it forever.
+					UploadSessionStore.Delete(session);
+					return Results.Problem("Upload integrity verification failed. The upload session was discarded; deploy again.", statusCode: StatusCodes.Status422UnprocessableEntity);
 				}
 
 				await ProcessUploadedZipAsync(session.PartFilePath, session.Metadata.ProjectName, session.Metadata.Version, session.Metadata.EnableBackup, session.Metadata.MirrorServerToLocal, session.Metadata.IgnoredFiles, session.Metadata.SynchronizedFiles, config, logger);

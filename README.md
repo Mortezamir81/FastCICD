@@ -149,7 +149,7 @@ Once configured, simply run the FastCICD Client console application. You will be
 * Use a long random `SecurityKey` (32+ characters); the server logs a warning otherwise. `AllowedClientIp` from older versions is ignored; use `AllowedClientIps`.
 * Upload requests use the server's `UploadHmacValidityMinutes` setting (15 minutes by default) because reverse proxies may buffer a chunk before forwarding it. Keep client and server clocks synchronized.
 * **Upgrading:** the signature format changed, so update the server and every client together.
-* Deployments use resumable chunks whose size is configured by the client clone through `DeployerSettings:UploadChunkSizeBytes`. A failed chunk is retried independently, and the server keeps the upload session and partial file until completion or cleanup.
+* Deployments use resumable chunks whose size is configured by the client clone through `DeployerSettings:UploadChunkSizeBytes`. A failed chunk is retried independently, and the server keeps the upload session and partial file until completion. Sessions with no activity for `UploadSessionRetentionHours` (24 by default) are deleted automatically, at most `MaxActiveUploadSessions` (20) may be pending at once, and each chunk is verified by its SHA-256. A deployment that fails while extracting is rolled back automatically.
 * The client stores a local resume manifest keyed by project, version, backup mode, and ZIP SHA-256. Re-running with the same artifact resumes the previous session; changed files or a changed version intentionally create a new deployment session.
 
 ---

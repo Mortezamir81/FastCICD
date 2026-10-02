@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Text.Json;
 using CICD_API.Models;
 
@@ -23,6 +23,55 @@ public static class UploadSessionStore
 	private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
 
 	public static string RootDirectory { get; } = Path.Combine(Path.GetTempPath(), "FastCICD-UploadSessions");
+
+	/// <summary>How long a session may stay inactive (no chunk received) before it is discarded.</summary>
+	public static TimeSpan Retention { get; set; } = TimeSpan.FromHours(24);
+
+	/// <summary>Number of sessions currently stored on disk.</summary>
+	public static int CountActive()
+		=> Directory.Exists(RootDirectory) ? Directory.EnumerateFiles(RootDirectory, "*.json").Count() : 0;
+
+	/// <summary>Free bytes on the drive that holds the session files.</summary>
+	public static long GetFreeBytes()
+	{
+		Directory.CreateDirectory(RootDirectory);
+		return new DriveInfo(Path.GetPathRoot(RootDirectory)!).AvailableFreeSpace;
+	}
+
+	/// <summary>Deletes inactive sessions and orphaned part files. Returns how many sessions were removed.</summary>
+	public static int Sweep(ILogger logger)
+	{
+		if (!Directory.Exists(RootDirectory))
+			return 0;
+
+		var removed = 0;
+		var cutoff = DateTime.UtcNow - Retention;
+		foreach (var metadataPath in Directory.EnumerateFiles(RootDirectory, "*.json").ToList())
+		{
+			var uploadId = Path.GetFileNameWithoutExtension(metadataPath);
+			if (File.GetLastWriteTimeUtc(metadataPath) >= cutoff)
+				continue;
+
+			Sessions.TryRemove(uploadId, out _);
+			TryDelete(metadataPath);
+			TryDelete(GetPartFilePath(uploadId));
+			removed++;
+			logger.LogInformation("Removed inactive upload session {UploadId}.", uploadId);
+		}
+
+		// Part files whose metadata is gone (crash during create/delete) can never be resumed.
+		foreach (var partPath in Directory.EnumerateFiles(RootDirectory, "*.part").ToList())
+		{
+			var uploadId = Path.GetFileNameWithoutExtension(partPath);
+			if (File.Exists(GetMetadataPath(uploadId)) || File.GetLastWriteTimeUtc(partPath) >= cutoff)
+				continue;
+
+			TryDelete(partPath);
+			logger.LogInformation("Removed orphaned upload file for {UploadId}.", uploadId);
+		}
+
+		return removed;
+	}
 
 	public static UploadSession Create(CreateUploadSessionRequest request)
 	{
@@ -69,7 +118,7 @@ public static class UploadSessionStore
 			var metadata = JsonSerializer.Deserialize<UploadSessionMetadata>(File.ReadAllText(metadataPath), JsonOptions);
 			if (metadata == null)
 				return null;
-			if (metadata.CreatedUtc < DateTime.UtcNow.AddHours(-24))
+			if (File.GetLastWriteTimeUtc(metadataPath) < DateTime.UtcNow - Retention)
 			{
 				TryDelete(metadataPath);
 				TryDelete(GetPartFilePath(uploadId));

@@ -1123,13 +1123,22 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 				var responseBody = await response.Content.ReadAsStringAsync();
 				LogUploadDiagnostic($"Chunk response. RequestId={requestId}; UploadId={session.UploadId}; ChunkIndex={chunkIndex}; Attempt={attempt}; Status={(int)response.StatusCode} {response.StatusCode}; Headers={FormatDiagnosticResponseHeaders(response)}; Body={TruncateUploadDiagnostic(responseBody)}");
 				if (!response.IsSuccessStatusCode)
-					throw new Exception($"HTTP {(int)response.StatusCode}: {responseBody}");
+				{
+					var statusCode = (int)response.StatusCode;
+					// Client errors (bad auth, session gone, ...) will not fix themselves; only timeouts, throttling and corrupted chunks are worth retrying.
+					if (statusCode is >= 400 and < 500 && statusCode is not (408 or 422 or 429))
+					{
+						var hint = statusCode == 404 ? " The upload session no longer exists on the server; run the deployment again." : "";
+						throw new NonRetryableUploadException($"HTTP {statusCode}: {responseBody}{hint}");
+					}
+					throw new Exception($"HTTP {statusCode}: {responseBody}");
+				}
 				sent = true;
 				completedBytes += length;
 				completedChunks.Add(chunkIndex);
 				uploadStatus($"Chunk {chunkIndex + 1}/{totalChunks} completed ({completedChunks.Count}/{totalChunks}).");
 			}
-			catch (Exception ex) when (attempt < 5)
+			catch (Exception ex) when (attempt < 5 && ex is not NonRetryableUploadException)
 			{
 				LogUploadDiagnostic($"Chunk failed. UploadId={session.UploadId}; ChunkIndex={chunkIndex}; Attempt={attempt}; ExceptionType={ex.GetType().Name}; Message={TruncateUploadDiagnostic(ex.ToString())}");
 				uploadStatus($"Chunk {chunkIndex + 1} failed: {Markup.Escape(ex.Message)}; retrying ({attempt}/4)...");
@@ -1263,6 +1272,8 @@ static async Task<string> ComputeFileHashAsync(string path)
 	using var sha256 = SHA256.Create();
 	return Convert.ToHexStringLower(await sha256.ComputeHashAsync(stream));
 }
+
+sealed class NonRetryableUploadException(string message) : Exception(message);
 
 sealed class DeploymentDashboard
 {
