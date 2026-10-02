@@ -654,55 +654,94 @@ public static class DeployEndpoints
 			if (Directory.Exists(baseDir) && Directory.EnumerateFileSystemEntries(baseDir).Any())
 			{
 				logger.LogInformation("Creating backup for '{ProjectName}' at '{BackupFilePath}'.", projectName, backupFilePath);
-				ZipFile.CreateFromDirectory(baseDir, backupFilePath);
+				try
+				{
+					ZipFile.CreateFromDirectory(baseDir, backupFilePath);
+				}
+				catch
+				{
+					// A half-written backup would look valid in the rollback list.
+					if (File.Exists(backupFilePath))
+						File.Delete(backupFilePath);
+					throw;
+				}
 			}
 		}
 
 		logger.LogInformation("Extracting uploaded zip to '{BaseDirectory}'.", baseDir);
 		using var archive = ZipFile.OpenRead(zipPath);
 		var normalizedBaseDir = Path.GetFullPath(baseDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+
+		// Validate every entry before touching the live directory.
 		foreach (var entry in archive.Entries)
 		{
 			var destinationPath = Path.GetFullPath(Path.Combine(normalizedBaseDir, entry.FullName));
 			if (!destinationPath.StartsWith(normalizedBaseDir, StringComparison.OrdinalIgnoreCase))
 				throw new InvalidDataException("The upload contains an invalid path.");
-
-			if (string.IsNullOrEmpty(entry.Name))
-				Directory.CreateDirectory(destinationPath);
-			else
-			{
-				Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
-				if (File.Exists(destinationPath))
-					File.SetAttributes(destinationPath, File.GetAttributes(destinationPath) & ~FileAttributes.ReadOnly);
-				entry.ExtractToFile(destinationPath, overwrite: true);
-			}
 		}
 
-		if (mirrorServerToLocal)
+		// The journal remembers every file this deployment changes so a failure can be undone.
+		using var journal = new DeployJournal(baseDir);
+		try
 		{
-			var synchronizedPaths = synchronizedFiles
-				.Select(path => path.Replace('/', '\\'))
-				.ToHashSet(StringComparer.OrdinalIgnoreCase);
-			foreach (var existingFile in Directory.EnumerateFiles(baseDir, "*", SearchOption.AllDirectories).ToList())
+			foreach (var entry in archive.Entries)
 			{
-				var relativePath = Path.GetRelativePath(baseDir, existingFile);
-				if (!IsIgnoredPath(relativePath, ignoredFiles) && !synchronizedPaths.Contains(relativePath.Replace('/', '\\')))
+				var destinationPath = Path.GetFullPath(Path.Combine(normalizedBaseDir, entry.FullName));
+				if (string.IsNullOrEmpty(entry.Name))
+					Directory.CreateDirectory(destinationPath);
+				else
 				{
-					File.SetAttributes(existingFile, File.GetAttributes(existingFile) & ~FileAttributes.ReadOnly);
-					File.Delete(existingFile);
-					logger.LogInformation("Mirror sync deleted extra server file '{FilePath}'.", relativePath);
+					Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+					journal.BeforeWrite(destinationPath);
+					if (File.Exists(destinationPath))
+						File.SetAttributes(destinationPath, File.GetAttributes(destinationPath) & ~FileAttributes.ReadOnly);
+					entry.ExtractToFile(destinationPath, overwrite: true);
 				}
 			}
-			foreach (var existingDirectory in Directory.EnumerateDirectories(baseDir, "*", SearchOption.AllDirectories)
-				.OrderByDescending(path => path.Length).ToList())
+
+			if (mirrorServerToLocal)
 			{
-				var relativePath = Path.GetRelativePath(baseDir, existingDirectory);
-				if (!IsIgnoredPath(relativePath, ignoredFiles) && !Directory.EnumerateFileSystemEntries(existingDirectory).Any())
+				var synchronizedPaths = synchronizedFiles
+					.Select(path => path.Replace('/', '\\'))
+					.ToHashSet(StringComparer.OrdinalIgnoreCase);
+				foreach (var existingFile in Directory.EnumerateFiles(baseDir, "*", SearchOption.AllDirectories).ToList())
 				{
-					Directory.Delete(existingDirectory);
-					logger.LogInformation("Mirror sync deleted extra server directory '{DirectoryPath}'.", relativePath);
+					var relativePath = Path.GetRelativePath(baseDir, existingFile);
+					if (!IsIgnoredPath(relativePath, ignoredFiles) && !synchronizedPaths.Contains(relativePath.Replace('/', '\\')))
+					{
+						journal.BeforeDelete(existingFile);
+						File.SetAttributes(existingFile, File.GetAttributes(existingFile) & ~FileAttributes.ReadOnly);
+						File.Delete(existingFile);
+						logger.LogInformation("Mirror sync deleted extra server file '{FilePath}'.", relativePath);
+					}
+				}
+				foreach (var existingDirectory in Directory.EnumerateDirectories(baseDir, "*", SearchOption.AllDirectories)
+					.OrderByDescending(path => path.Length).ToList())
+				{
+					var relativePath = Path.GetRelativePath(baseDir, existingDirectory);
+					if (!IsIgnoredPath(relativePath, ignoredFiles) && !Directory.EnumerateFileSystemEntries(existingDirectory).Any())
+					{
+						journal.BeforeDeleteDirectory(existingDirectory);
+						Directory.Delete(existingDirectory);
+						logger.LogInformation("Mirror sync deleted extra server directory '{DirectoryPath}'.", relativePath);
+					}
 				}
 			}
+
+			journal.Commit();
+		}
+		catch (Exception ex)
+		{
+			logger.LogError(ex, "Deployment of '{ProjectName}' failed; restoring the previous files.", projectName);
+			var failures = journal.Rollback();
+			if (failures.Count == 0)
+			{
+				logger.LogWarning("Rolled back the failed deployment of '{ProjectName}'; the previous files were restored.", projectName);
+				throw new IOException($"Deployment failed ({ex.Message}). The previous files were restored.", ex);
+			}
+
+			logger.LogError("Rollback of '{ProjectName}' could not restore {Count} file(s): {Files}", projectName, failures.Count, string.Join(", ", failures));
+			throw new IOException($"Deployment failed ({ex.Message}) and {failures.Count} file(s) could not be restored, for example: {string.Join(", ", failures.Take(5))}. Restore from a backup.", ex);
 		}
 
 		if (enableBackup && !string.IsNullOrEmpty(backupDirBase))
