@@ -36,7 +36,6 @@ if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(apiKey) || 
 
 var handler = new HmacDelegatingHandler(() => config["DeployerSettings:SecurityKey"] ?? "", new HttpClientHandler());
 using var httpClient = new HttpClient(handler) { BaseAddress = new Uri(endpoint) };
-httpClient.DefaultRequestHeaders.Add("X-Api-Key", apiKey);
 httpClient.Timeout = TimeSpan.FromMinutes(60);
 
 while (true)
@@ -48,12 +47,6 @@ while (true)
 	uploadChunkSizeBytes = GetUploadChunkSizeBytes(settings);
 	if (Uri.TryCreate(endpoint, UriKind.Absolute, out var refreshedEndpoint))
 		httpClient.BaseAddress = refreshedEndpoint;
-	var refreshedApiKey = settings["SecurityKey"];
-	if (!string.IsNullOrWhiteSpace(refreshedApiKey))
-	{
-		httpClient.DefaultRequestHeaders.Remove("X-Api-Key");
-		httpClient.DefaultRequestHeaders.Add("X-Api-Key", refreshedApiKey);
-	}
 
 	if (projects.Count == 0)
 	{
@@ -1079,6 +1072,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 		var length = Math.Min((long)session.ChunkSize, totalBytes - offset);
 		var uploadedBeforeChunk = completedBytes;
 		var sent = false;
+		var chunkHash = await ComputeFileRangeHashAsync(uploadZipPath, offset, length);
 
 		for (var attempt = 1; attempt <= 5 && !sent; attempt++)
 		{
@@ -1118,6 +1112,7 @@ static async Task UploadResumableAsync(HttpClient client, ProjectConfig project,
 				};
 				var requestId = Guid.NewGuid().ToString("N");
 				request.Headers.TryAddWithoutValidation("X-Request-Id", requestId);
+				request.Headers.TryAddWithoutValidation(HmacDelegatingHandler.BodyHashHeader, chunkHash);
 				LogUploadDiagnostic($"Chunk sending. RequestId={requestId}; UploadId={session.UploadId}; ChunkIndex={chunkIndex}; Offset={offset}; Length={length}; Attempt={attempt}");
 				using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
 				var responseBody = await response.Content.ReadAsStringAsync();
@@ -1236,6 +1231,24 @@ static Task DeletePendingUploadManifestAsync(string path)
 	if (File.Exists(path))
 		File.Delete(path);
 	return Task.CompletedTask;
+}
+
+static async Task<string> ComputeFileRangeHashAsync(string path, long offset, long length)
+{
+	await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+	stream.Position = offset;
+	using var sha256 = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+	var buffer = new byte[64 * 1024];
+	var remaining = length;
+	while (remaining > 0)
+	{
+		var read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)));
+		if (read == 0)
+			throw new EndOfStreamException("The upload artifact is shorter than expected.");
+		sha256.AppendData(buffer, 0, read);
+		remaining -= read;
+	}
+	return Convert.ToHexStringLower(sha256.GetHashAndReset());
 }
 
 static async Task<string> ComputeFileHashAsync(string path)

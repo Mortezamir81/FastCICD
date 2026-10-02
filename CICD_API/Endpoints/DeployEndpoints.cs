@@ -525,8 +525,24 @@ public static class DeployEndpoints
 				long offset = (long)chunkIndex * metadata.ChunkSize;
 				await using var stream = new FileStream(session.PartFilePath, FileMode.Open, FileAccess.Write, FileShare.Read, 64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
 				stream.Position = offset;
-				await request.Body.CopyToAsync(stream, request.HttpContext.RequestAborted);
+
+				// The chunk hash is covered by the request signature; verify it while the body streams to disk.
+				using var chunkHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+				var copyBuffer = new byte[64 * 1024];
+				int bytesRead;
+				while ((bytesRead = await request.Body.ReadAsync(copyBuffer, request.HttpContext.RequestAborted)) > 0)
+				{
+					chunkHash.AppendData(copyBuffer, 0, bytesRead);
+					await stream.WriteAsync(copyBuffer.AsMemory(0, bytesRead), request.HttpContext.RequestAborted);
+				}
 				await stream.FlushAsync(request.HttpContext.RequestAborted);
+
+				var actualChunkHash = Convert.ToHexStringLower(chunkHash.GetHashAndReset());
+				if (!string.Equals(actualChunkHash, request.Headers["X-Content-Sha256"].ToString(), StringComparison.OrdinalIgnoreCase))
+				{
+					logger.LogWarning("Chunk rejected. RequestId: {RequestId}; UploadId: {UploadId}; ChunkIndex: {ChunkIndex}; Status: 422; Reason: Chunk hash mismatch", requestId, uploadId, chunkIndex);
+					return Results.Problem("Chunk integrity verification failed.", statusCode: StatusCodes.Status422UnprocessableEntity);
+				}
 
 				lock (session.SyncRoot)
 				{

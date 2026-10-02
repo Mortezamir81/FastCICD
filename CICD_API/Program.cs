@@ -36,6 +36,11 @@ builder.Services.AddSingleton<MigrationRequestAuthenticator>();
 var app = builder.Build();
 
 app.UseForwardedHeaders();
+
+if ((app.Configuration["SecurityKey"]?.Length ?? 0) < 32)
+	app.Logger.LogWarning("SecurityKey is missing or shorter than 32 characters. Use a long random key.");
+if (!string.IsNullOrWhiteSpace(app.Configuration["AllowedClientIp"]))
+	app.Logger.LogWarning("AllowedClientIp is no longer used: a matching IP no longer bypasses signatures. Use AllowedClientIps (a list) to restrict clients.");
 app.Logger.LogInformation("Upload diagnostics file configured at {UploadDiagnosticsLogPath}", uploadDiagnosticsLogPath);
 
 app.Use(async (context, next) =>

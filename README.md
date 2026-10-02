@@ -11,7 +11,7 @@ Created with ❤️ by **Morteza Mirshekar**.
 ## ✨ Why FastCICD? (Key Features)
 
 * **⚡ Delta Deployments:** Why upload everything? FastCICD hashes your files locally and remotely, uploading *only* what has changed. This makes deployments incredibly fast.
-* **🛡️ Dual-Layer Security:** Protects your server using IP Whitelisting combined with time-sensitive HMAC-SHA256 signatures. No unauthorized access!
+* **🛡️ Signed Requests:** Every request is signed with HMAC-SHA256 over its method, path, body hash, timestamp and a single-use nonce. Your secret key is never sent over the network. An optional IP allow-list adds a second layer.
 * **⚙️ Automated Service Management:** Safely stops required Windows Services before deploying and restarts them automatically afterward.
 * **⏪ Auto-Backups & 1-Click Rollbacks:** Every deployment automatically creates a `.zip` backup of your server's current state. Broke something? Roll back instantly via the interactive menu.
 * **🪝 Pre & Post Deploy Hooks:** Run automated CLI commands (like database migrations or npm scripts) on the server before or after your code is uploaded.
@@ -63,7 +63,7 @@ Deploy the Server API to your hosting environment. In your server's `appsettings
       "Microsoft.AspNetCore": "Warning"
     }
   },
-  "AllowedClientIp": "192.168.1.100", // Leave empty "" to rely solely on HMAC Dynamic Security
+  "AllowedClientIps": [], // Optional extra restriction, e.g. ["192.168.1.100"]. Requests must ALSO be signed.
   "SecurityKey": "YOUR_SUPER_SECRET_KEY_HERE_MAKE_IT_LONG",
   "BackupDirectory": "C:\\Deployments\\Backups",
   "AllowedDirectories": {
@@ -144,8 +144,11 @@ Once configured, simply run the FastCICD Client console application. You will be
 
 ## 🔒 Security Notes
 * **Never share your `SecurityKey`.** It acts as the master password between your client and server.
-* The HMAC signature generates a unique cryptographic hash for every request based on the current time. This completely prevents **Replay Attacks**. If a request is intercepted, it will naturally expire in 5 minutes and cannot be reused.
-* Upload requests use the server's `UploadHmacValidityMinutes` setting (120 minutes in the example configuration) because reverse proxies may buffer large multipart requests before forwarding them. Keep client and server clocks synchronized.
+* Each request carries an HMAC-SHA256 signature over its method, path, query, body SHA-256, timestamp and a random nonce. The server rejects expired timestamps, reused nonces and bodies that do not match the signed hash, so an intercepted request cannot be replayed or altered. The `SecurityKey` itself is never transmitted.
+* Use HTTPS (directly or behind a reverse proxy). Signatures protect integrity and prevent replay, but they do not encrypt your files.
+* Use a long random `SecurityKey` (32+ characters); the server logs a warning otherwise. `AllowedClientIp` from older versions is ignored; use `AllowedClientIps`.
+* Upload requests use the server's `UploadHmacValidityMinutes` setting (15 minutes by default) because reverse proxies may buffer a chunk before forwarding it. Keep client and server clocks synchronized.
+* **Upgrading:** the signature format changed, so update the server and every client together.
 * Deployments use resumable chunks whose size is configured by the client clone through `DeployerSettings:UploadChunkSizeBytes`. A failed chunk is retried independently, and the server keeps the upload session and partial file until completion or cleanup.
 * The client stores a local resume manifest keyed by project, version, backup mode, and ZIP SHA-256. Re-running with the same artifact resumes the previous session; changed files or a changed version intentionally create a new deployment session.
 
