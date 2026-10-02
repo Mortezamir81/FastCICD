@@ -26,6 +26,9 @@ public static class DeployEndpoints
 	private static string GetMetadataPath(string backupDirBase, string projectName)
 		=> Path.Combine(backupDirBase, projectName, "project_metadata.json");
 
+	// camelCase keeps the NDJSON event keys ("type", "message", "command") matching what the client reads.
+	private static readonly JsonSerializerOptions EventJsonOptions = new(JsonSerializerDefaults.Web);
+
 	private static string GetRequestId(HttpRequest request)
 		=> request.Headers["X-Request-Id"].FirstOrDefault() ?? request.HttpContext.TraceIdentifier;
 
@@ -49,15 +52,23 @@ public static class DeployEndpoints
 			var missingOrChanged = new ConcurrentBag<string>();
 			var ignoredFiles = request.IgnoredFiles ?? [];
 
+			// Normalize the configured directory so separators and casing in appsettings cannot change the result.
+			var normalizedBaseDir = Path.GetFullPath(baseDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+
+			// Reject unsafe paths loudly; skipping them would report a false "up to date".
+			foreach (var key in request.FileHashes.Keys)
+			{
+				if (Path.IsPathRooted(key) ||
+					!Path.GetFullPath(Path.Combine(normalizedBaseDir, key)).StartsWith(normalizedBaseDir, StringComparison.OrdinalIgnoreCase))
+				{
+					logger.LogWarning("Comparison rejected: path '{Path}' is outside project '{ProjectName}'.", key, request.ProjectName);
+					return Results.BadRequest($"Invalid file path in comparison request: '{key}'.");
+				}
+			}
+
 			Parallel.ForEach(request.FileHashes, file =>
 			{
-				if (file.Key.Contains("..") || Path.IsPathRooted(file.Key))
-					return;
-
-				var remoteFilePath = Path.GetFullPath(Path.Combine(baseDir, file.Key));
-
-				if (!remoteFilePath.StartsWith(baseDir))
-					return;
+				var remoteFilePath = Path.GetFullPath(Path.Combine(normalizedBaseDir, file.Key));
 
 				if (!File.Exists(remoteFilePath))
 				{
@@ -69,7 +80,7 @@ public static class DeployEndpoints
 				using var stream = File.OpenRead(remoteFilePath);
 				var remoteHash = Convert.ToHexStringLower(sha256.ComputeHash(stream));
 
-				if (remoteHash != file.Value)
+				if (!string.Equals(remoteHash, file.Value, StringComparison.OrdinalIgnoreCase))
 					missingOrChanged.Add(file.Key);
 			});
 
@@ -394,7 +405,7 @@ public static class DeployEndpoints
 				await writeLock.WaitAsync(cancellationToken);
 				try
 				{
-					await JsonSerializer.SerializeAsync(response.Body, value, cancellationToken: cancellationToken);
+					await JsonSerializer.SerializeAsync(response.Body, value, EventJsonOptions, cancellationToken);
 					await response.Body.WriteAsync("\n"u8.ToArray(), cancellationToken);
 					await response.Body.FlushAsync(cancellationToken);
 				}
