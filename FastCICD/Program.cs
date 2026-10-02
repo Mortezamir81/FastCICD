@@ -772,7 +772,10 @@ static Dictionary<string, string> GetLocalFileHashes(string basePath, List<strin
 
 		bool isIgnored = ignoredPaths.Any(ignored =>
 		{
-			var normalizedIgnored = ignored.Replace('/', '\\');
+			// Trim both ends so "logs/" and "\logs" behave like "logs".
+			var normalizedIgnored = ignored.Replace('/', '\\').Trim('\\');
+			if (normalizedIgnored.Length == 0)
+				return false;
 
 			return normalizedRelativePath.Equals(normalizedIgnored, StringComparison.OrdinalIgnoreCase) ||
 							   normalizedRelativePath.StartsWith(normalizedIgnored + "\\", StringComparison.OrdinalIgnoreCase) ||
